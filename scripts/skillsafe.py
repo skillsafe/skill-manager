@@ -247,6 +247,8 @@ class Scanner:
         (r"""require\s*\(\s*['"]child_process['"]\s*\)""", "js_child_process", "high", "child_process module enables shell command execution"),
         (r"\b(?:execSync|execFileSync)\s*\(", "js_exec_sync", "high", "execSync() executes shell commands synchronously"),
         (r"\b(?:spawnSync)\s*\(", "js_spawn_sync", "high", "spawnSync() executes external commands"),
+        (r"""import\s+.*\bfrom\s+['"]child_process['"]""", "js_child_process_import", "high", "child_process ES module import enables shell command execution"),
+        (r"""import\s+.*\bfrom\s+['"]fs['"]""", "js_fs_import", "medium", "fs ES module import enables filesystem access"),
     ]
 
     # Compiled once
@@ -344,10 +346,11 @@ class Scanner:
                 secret_findings.extend(self._scan_secrets(fpath, path))
         all_findings.extend(secret_findings)
 
-        # Pass 4: Prompt injection (markdown files only)
+        # Pass 4: Prompt injection (text-like files)
+        _injection_extensions = {".md", ".txt", ".yaml", ".yml", ".rst"}
         injection_findings = []
         for fpath in files:
-            if fpath.suffix == ".md":
+            if fpath.suffix.lower() in _injection_extensions:
                 injection_findings.extend(self._scan_prompt_injection(fpath, path))
         all_findings.extend(injection_findings)
 
@@ -454,9 +457,16 @@ class Scanner:
 
         for lineno_0, line in enumerate(lines):
             stripped = line.lstrip()
-            # Skip comment lines
-            if stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+            # Skip single-line comments
+            if stripped.startswith("//"):
                 continue
+            # Skip pure JSDoc/block comment markers
+            if stripped == "*" or stripped == "*/" or stripped.startswith("/*"):
+                continue
+            # For JSDoc `* text` lines, strip the leading `* ` and scan the remainder
+            if stripped.startswith("* ") or stripped.startswith("*\t"):
+                stripped = stripped[2:]
+                # Fall through to scan the remainder
 
             for pattern, rule_id, severity, message in self._JS_COMPILED:
                 if pattern.search(line):
@@ -584,6 +594,10 @@ def create_archive(path: Path) -> bytes:
                     continue
                 entries.append(Path(dirpath) / fname)
 
+        MAX_FILE_COUNT = 5000
+        if len(entries) > MAX_FILE_COUNT:
+            raise SkillSafeError("too_many_files", f"Too many files ({len(entries)}). Maximum is {MAX_FILE_COUNT}.")
+
         for fpath in entries:
             # Guard against symlinks that escape the skill directory tree
             if fpath.is_symlink():
@@ -699,14 +713,16 @@ class SkillSafeClient:
         parts: List[bytes] = []
 
         for name, filename, data, ct in fields:
+            # Sanitize name field to prevent CRLF injection
+            safe_name = name.replace("\r", "").replace("\n", "")
             header_lines = [f"--{boundary}"]
             if filename:
                 # Sanitize filename: escape backslashes/quotes, strip CRLF to prevent header injection
                 safe_filename = filename.replace("\\", "\\\\").replace('"', '\\"')
                 safe_filename = safe_filename.replace("\r", "").replace("\n", "")
-                header_lines.append(f'Content-Disposition: form-data; name="{name}"; filename="{safe_filename}"')
+                header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"; filename="{safe_filename}"')
             else:
-                header_lines.append(f'Content-Disposition: form-data; name="{name}"')
+                header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"')
             header_lines.append(f"Content-Type: {ct}")
             header_lines.append("")
             header_bytes = "\r\n".join(header_lines).encode("utf-8")
@@ -855,7 +871,7 @@ def parse_skill_ref(ref: str) -> Tuple[str, str]:
     Parse '@namespace/skill-name' into (namespace, name).
 
     Accepts with or without the leading '@'.
-    Namespace and name must contain only lowercase alphanumeric characters,
+    Namespace and name must contain only alphanumeric characters (case-insensitive),
     hyphens, underscores, and dots.
     """
     ref = ref.lstrip("@")
@@ -871,6 +887,17 @@ def parse_skill_ref(ref: str) -> Tuple[str, str]:
     if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$', name):
         raise SkillSafeError("invalid_reference", f"Invalid skill name '{name}'. Use alphanumeric characters, dots, hyphens, and underscores (1-101 chars).")
     return namespace, name
+
+
+def _validate_skill_name(name: str) -> None:
+    """Validate a skill name derived from a directory name or --name flag.
+
+    Uses the same regex as parse_skill_ref to ensure consistency.
+    Prints an error and exits if the name is invalid.
+    """
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$', name):
+        print(f"Error: Invalid skill name '{name}'. Use alphanumeric characters, dots, hyphens, and underscores (1-101 chars, must start with alphanumeric).", file=sys.stderr)
+        sys.exit(1)
 
 
 def _validate_saved_key(api_base: str) -> bool:
@@ -1163,8 +1190,11 @@ def cmd_save(args: argparse.Namespace) -> None:
     name = path.name
     namespace = cfg["username"]
 
+    _validate_skill_name(name)
+
     if name in RESERVED_SKILL_NAMES:
-        return
+        print(f"Error: '{name}' is a reserved name and cannot be used as a skill name.", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Saving {bold(f'@{namespace}/{name}')} v{version}...\n")
 
@@ -1251,44 +1281,91 @@ def cmd_share(args: argparse.Namespace) -> None:
 def cmd_install(args: argparse.Namespace) -> None:
     """Install a skill from the registry."""
     cfg = require_config()
-    namespace, name = parse_skill_ref(args.skill)
-    version: Optional[str] = getattr(args, "version", None)
+
+    # Detect share link references (shr_ prefix or URL containing /share/shr_)
+    skill_ref = args.skill
+    share_id: Optional[str] = None
+    if skill_ref.startswith("shr_"):
+        share_id = skill_ref
+    elif "/share/shr_" in skill_ref:
+        share_id = skill_ref.split("/share/")[-1].split("?")[0]
 
     client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
-    # Step 1: Resolve version
-    if not version:
-        print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
+    if share_id:
+        # Share link install path
+        print(f"Installing via share link {bold(share_id)}...\n")
+
+        print("  Downloading archive via share link...")
         try:
-            meta = client.get_metadata(namespace, name, auth=True)
-            version = meta.get("latest_version")
-            if not version:
-                print("Error: No published versions found.", file=sys.stderr)
-                sys.exit(1)
+            archive_bytes, server_tree_hash, version = client.download_via_share(share_id)
         except SkillSafeError as e:
-            print(f"Error: {e.message}", file=sys.stderr)
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+
+        if not version:
+            version = "unknown"
+
+        # Try to extract namespace/name from archive's SKILL.md
+        namespace = "shared"
+        name = share_id
+        try:
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name == "SKILL.md" or member.name.endswith("/SKILL.md"):
+                        f = tar.extractfile(member)
+                        if f:
+                            text = f.read().decode("utf-8", errors="replace")
+                            for line in text.splitlines():
+                                if line.startswith("name:"):
+                                    name = line[len("name:"):].strip()
+                                    break
+                        break
+        except Exception:
+            pass  # Use defaults if we can't parse SKILL.md
+
+    else:
+        namespace, name = parse_skill_ref(skill_ref)
+        version = getattr(args, "version", None)
+
+        # Step 1: Resolve version
+        if not version:
+            print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
+            try:
+                meta = client.get_metadata(namespace, name, auth=True)
+                version = meta.get("latest_version")
+                if not version:
+                    print("Error: No published versions found.", file=sys.stderr)
+                    sys.exit(1)
+            except SkillSafeError as e:
+                print(f"Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+
+        # Validate version format to prevent path traversal via malicious server response
+        semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+        if not re.match(semver_re, version):
+            print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0).", file=sys.stderr)
             sys.exit(1)
 
-    # Validate version format to prevent path traversal via malicious server response
-    semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
-    if not re.match(semver_re, version):
-        print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0).", file=sys.stderr)
-        sys.exit(1)
+        print(f"Installing {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    print(f"Installing {bold(f'@{namespace}/{name}')} v{version}...\n")
-
-    # Step 2: Download
-    print("  Downloading archive...")
-    try:
-        archive_bytes, server_tree_hash = client.download(namespace, name, version)
-    except SkillSafeError as e:
-        print(f"  Error: {e.message}", file=sys.stderr)
-        sys.exit(1)
-    print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+        # Step 2: Download
+        print("  Downloading archive...")
+        try:
+            archive_bytes, server_tree_hash = client.download(namespace, name, version)
+        except SkillSafeError as e:
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
 
     # Step 3: Verify tree hash
     local_tree_hash = compute_tree_hash(archive_bytes)
-    if server_tree_hash and local_tree_hash != server_tree_hash:
+    if not server_tree_hash:
+        print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
+        print("Aborting installation for safety.", file=sys.stderr)
+        sys.exit(1)
+    if local_tree_hash != server_tree_hash:
         print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
         print(f"    Server:  {server_tree_hash}")
         print(f"    Local:   {local_tree_hash}")
@@ -1315,9 +1392,14 @@ def cmd_install(args: argparse.Namespace) -> None:
         verdict = verdict_result.get("verdict", "unknown")
         details = verdict_result.get("details", {})
     except SkillSafeError as e:
-        # Verification may fail (self-verify, rate-limit) — still allow install
-        print(f"  Verification skipped: {e.message}")
-        verdict = "skipped"
+        if e.status == 403:
+            # Expected for self-verify scenarios
+            print(f"  Verification skipped: {e.message}")
+            verdict = "skipped"
+        else:
+            print(f"  Warning: Verification failed due to error: {e.message}", file=sys.stderr)
+            print("  Continuing without verification.", file=sys.stderr)
+            verdict = "error"
         details = {}
 
     # Step 6: Display verdict and prompt
@@ -1344,7 +1426,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             print(f"    {key}: {val}")
         print("  Aborting installation.")
         sys.exit(1)
-    elif verdict == "skipped":
+    elif verdict in ("skipped", "error"):
         pass  # Already printed reason above
     else:
         print(f"  Verdict: {verdict}")
@@ -1393,12 +1475,13 @@ def cmd_search(args: argparse.Namespace) -> None:
     query: Optional[str] = getattr(args, "query", None)
     category: Optional[str] = getattr(args, "category", None)
     sort: str = getattr(args, "sort", "popular")
+    limit: int = getattr(args, "limit", 20)
 
     cfg = load_config()
     client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE))
 
     try:
-        resp = client.search(query=query, category=category, sort=sort)
+        resp = client.search(query=query, category=category, sort=sort, limit=limit)
     except SkillSafeError as e:
         print(f"Error: {e.message}", file=sys.stderr)
         sys.exit(1)
@@ -1598,8 +1681,11 @@ def cmd_backup(args: argparse.Namespace) -> None:
     name = args.name if hasattr(args, "name") and args.name else skill_path.name
     namespace = cfg["username"]
 
+    _validate_skill_name(name)
+
     if name in RESERVED_SKILL_NAMES:
-        return
+        print(f"Error: '{name}' is a reserved name and cannot be used as a skill name.", file=sys.stderr)
+        sys.exit(1)
 
     client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
@@ -1713,7 +1799,11 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
     # Verify tree hash
     local_tree_hash = compute_tree_hash(archive_bytes)
-    if server_tree_hash and local_tree_hash != server_tree_hash:
+    if not server_tree_hash:
+        print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
+        print("Aborting restore for safety.", file=sys.stderr)
+        sys.exit(1)
+    if local_tree_hash != server_tree_hash:
         print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
         print(f"    Server:  {server_tree_hash}")
         print(f"    Local:   {local_tree_hash}")
@@ -1732,11 +1822,30 @@ def cmd_restore(args: argparse.Namespace) -> None:
         # Scan restored files for security issues (warn but don't block)
         print("  Scanning restored skill...")
         scanner = Scanner()
-        scan_report = scanner.scan(tmppath)
+        scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
         _print_scan_results(scan_report, indent=2)
 
         if not scan_report.get("clean", True):
             print(yellow("\n  WARNING: Security issues found in restored skill."))
+
+        # Submit verification report (dual-side verification)
+        print("\n  Submitting verification report...")
+        try:
+            verify_resp = client.verify(namespace, skill_name, version, scan_report)
+            verify_verdict = verify_resp.get("verdict", "unknown")
+            if verify_verdict == "verified":
+                print(green("  Verified: publisher and consumer scans match."))
+            elif verify_verdict == "critical":
+                print(red("  CRITICAL: Tree hash mismatch detected by server!"))
+                print("  Aborting restore.")
+                sys.exit(1)
+            elif verify_verdict == "divergent":
+                print(yellow("  WARNING: Scan reports diverge."))
+        except SkillSafeError as e:
+            if e.status == 403:
+                pass  # Expected for self-restore
+            else:
+                print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
 
         # Extract to final target directory
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -1769,6 +1878,9 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
         return Path(skills_dir).expanduser().resolve()
     tool = getattr(args, "tool", None)
     if tool:
+        if tool not in TOOL_SKILLS_DIRS:
+            print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}", file=sys.stderr)
+            sys.exit(1)
         return TOOL_SKILLS_DIRS[tool]
     return None
 
@@ -1893,6 +2005,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_search.add_argument("query", nargs="?", help="Search query")
     p_search.add_argument("--category", help="Filter by category")
     p_search.add_argument("--sort", default="popular", choices=["popular", "recent", "verified", "trending", "hot"], help="Sort order")
+    p_search.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
 
     # -- info ---------------------------------------------------------------
     p_info = subparsers.add_parser("info", help="Get skill details")
