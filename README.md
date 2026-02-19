@@ -6,7 +6,7 @@ Works with **Claude Code**, **Cursor**, and **Windsurf**.
 
 ## Quick Start
 
-No dependencies to install — uses only Python stdlib. Requires Python 3.9+.
+No dependencies to install — uses only Python stdlib. Requires Python 3.8+.
 
 ```bash
 # Sign in via browser

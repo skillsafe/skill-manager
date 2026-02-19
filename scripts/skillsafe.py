@@ -52,8 +52,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # Python version guard
 # ---------------------------------------------------------------------------
 
-if sys.version_info < (3, 9):
-    print("Error: Python 3.9+ is required.", file=sys.stderr)
+if sys.version_info < (3, 8):
+    print("Error: Python 3.8+ is required.", file=sys.stderr)
     sys.exit(1)
 
 
@@ -610,7 +610,8 @@ def compute_tree_hash_v2(files: list[dict]) -> str:
     sorted_files = sorted(files, key=lambda f: f["path"])
     manifest = ""
     for f in sorted_files:
-        hex_hash = f["hash"].removeprefix("sha256:")
+        h = f["hash"]
+        hex_hash = h[len("sha256:"):] if h.startswith("sha256:") else h
         manifest += f"{f['path']}\0{hex_hash}\n"
     return "sha256tree:" + hashlib.sha256(manifest.encode("utf-8")).hexdigest()
 
