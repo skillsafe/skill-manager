@@ -34,6 +34,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -68,6 +69,7 @@ CONFIG_DIR = Path.home() / ".skillsafe"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SKILLS_DIR = CONFIG_DIR / "skills"
 CACHE_DIR = CONFIG_DIR / "cache"
+BLOB_CACHE_DIR = CACHE_DIR / "blobs"
 
 TOOL_SKILLS_DIRS: Dict[str, Path] = {
     "claude": Path.home() / ".claude" / "skills",
@@ -102,10 +104,11 @@ TEXT_EXTENSIONS = {
 class SkillSafeError(Exception):
     """Error returned by the SkillSafe API."""
 
-    def __init__(self, code: str, message: str, status: int = 0):
+    def __init__(self, code: str, message: str, status: int = 0, retry_after: Optional[int] = None):
         self.code = code
         self.message = message
         self.status = status
+        self.retry_after = retry_after  # seconds from Retry-After header (GAP-7.3)
         super().__init__(f"[{code}] {message}")
 
 
@@ -570,6 +573,90 @@ def compute_tree_hash(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
+def compute_tree_hash_v2(files: list[dict]) -> str:
+    """
+    Compute the v2 tree hash from a file manifest.
+
+    Matches the server implementation in api/src/lib/hash.ts:computeTreeHashV2.
+    Files are sorted by path, each line is "path\\0hex\\n", concatenated, then
+    SHA-256 hashed with "sha256tree:" prefix.
+    """
+    sorted_files = sorted(files, key=lambda f: f["path"])
+    manifest = ""
+    for f in sorted_files:
+        hex_hash = f["hash"].removeprefix("sha256:")
+        manifest += f"{f['path']}\0{hex_hash}\n"
+    return "sha256tree:" + hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+
+
+def build_file_manifest(path: Path) -> list[dict]:
+    """
+    Walk a directory and build a v2 file manifest.
+
+    Returns a list of {"path": relative_path, "hash": "sha256:<hex>", "size": N}
+    for each file, using the same traversal rules as create_archive().
+    """
+    path = path.resolve()
+    skip_dirs = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".skillsafe"}
+    files: list[dict] = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs and not d.startswith("."))
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            fpath = Path(dirpath) / fname
+            # Guard against symlinks that escape the skill directory tree
+            if fpath.is_symlink():
+                resolved = fpath.resolve()
+                if not str(resolved).startswith(str(path) + os.sep) and resolved != path:
+                    continue
+            rel = str(fpath.relative_to(path))
+            content = fpath.read_bytes()
+            file_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+            files.append({"path": rel, "hash": file_hash, "size": len(content)})
+
+    MAX_FILE_COUNT = 5000
+    if len(files) > MAX_FILE_COUNT:
+        raise SkillSafeError("too_many_files", f"Too many files ({len(files)}). Maximum is {MAX_FILE_COUNT}.")
+
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Blob cache
+# ---------------------------------------------------------------------------
+
+
+def get_cached_blob(blob_hash: str) -> Optional[bytes]:
+    """Check local blob cache. Returns bytes if cached and hash verified, else None."""
+    cache_path = BLOB_CACHE_DIR / blob_hash
+    if not cache_path.exists():
+        return None
+    try:
+        data = cache_path.read_bytes()
+    except (OSError, IOError):
+        # GAP-4.2: Corrupted/unreadable cache entry (e.g. directory, permission
+        # denied, disk error) — delete and re-download instead of crashing
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+    if actual_hash != blob_hash:
+        # Corrupted cache entry — delete and re-download
+        cache_path.unlink(missing_ok=True)
+        return None
+    return data
+
+
+def cache_blob(blob_hash: str, data: bytes) -> None:
+    """Write blob to local cache."""
+    BLOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = BLOB_CACHE_DIR / blob_hash
+    cache_path.write_bytes(data)
+
+
 # ---------------------------------------------------------------------------
 # Archive creation
 # ---------------------------------------------------------------------------
@@ -684,6 +771,14 @@ class SkillSafeClient:
                     raise SkillSafeError("invalid_response", f"Server returned invalid JSON: {data[:200]!r}", 0)
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", errors="replace")
+            # Parse Retry-After header for 429 responses (GAP-7.3)
+            retry_after: Optional[int] = None
+            if e.code == 429:
+                ra_header = e.headers.get("Retry-After", "")
+                try:
+                    retry_after = max(1, min(60, int(ra_header)))
+                except (ValueError, TypeError):
+                    retry_after = 5  # default 5s if header missing/invalid
             try:
                 err = json.loads(error_body)
                 err_info = err.get("error", {})
@@ -691,11 +786,12 @@ class SkillSafeClient:
                     code=err_info.get("code", "unknown"),
                     message=err_info.get("message", error_body),
                     status=e.code,
+                    retry_after=retry_after,
                 )
             except SkillSafeError:
                 raise
             except Exception:
-                raise SkillSafeError("http_error", f"HTTP {e.code}: {error_body}", e.code)
+                raise SkillSafeError("http_error", f"HTTP {e.code}: {error_body}", e.code, retry_after=retry_after)
         except urllib.error.URLError as e:
             raise SkillSafeError("connection_error", f"Cannot connect to {self.api_base}: {e.reason}", 0)
 
@@ -753,6 +849,65 @@ class SkillSafeClient:
         resp = self._request("POST", f"/v1/skills/@{namespace}/{name}", body=body, content_type=ct)
         return resp.get("data", resp)
 
+    def negotiate(
+        self,
+        namespace: str,
+        name: str,
+        version: str,
+        file_manifest: list[dict],
+    ) -> dict:
+        """POST /v1/skills/@{ns}/{name}/negotiate -- determine which files need uploading."""
+        payload = {
+            "version": version,
+            "file_manifest": file_manifest,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{namespace}/{name}/negotiate",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def save_v2(
+        self,
+        namespace: str,
+        name: str,
+        metadata: Dict[str, Any],
+        file_manifest: list[dict],
+        needed_files: list[str],
+        skill_path: Path,
+        scan_report_json: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name} -- save using v2 file upload protocol.
+
+        Sends file_manifest in the metadata JSON and only uploads files
+        whose paths appear in needed_files.
+        """
+        # Build metadata with file_manifest included
+        meta = dict(metadata)
+        meta["file_manifest"] = file_manifest
+
+        fields: List[Tuple[str, str, bytes, str]] = [
+            ("metadata", "", json.dumps(meta).encode("utf-8"), "application/json"),
+        ]
+
+        if scan_report_json:
+            fields.append(("scan_report", "", scan_report_json.encode("utf-8"), "application/json"))
+
+        # Add file fields for needed files only
+        skill_path = Path(skill_path).resolve()
+        for i, rel_path in enumerate(needed_files):
+            file_path = skill_path / rel_path
+            content = file_path.read_bytes()
+            # The filename carries the relative path (server reads it from value.name)
+            fields.append((f"file_{i}", rel_path, content, "application/octet-stream"))
+
+        body, ct = self._build_multipart(fields)
+        resp = self._request("POST", f"/v1/skills/@{namespace}/{name}", body=body, content_type=ct)
+        return resp.get("data", resp)
+
     def share(
         self,
         namespace: str,
@@ -774,30 +929,42 @@ class SkillSafeClient:
         )
         return resp.get("data", resp)
 
-    def download_via_share(self, share_id: str) -> Tuple[bytes, str, str]:
+    def download_via_share(self, share_id: str):
         """
-        GET /v1/share/{share_id}/download — download archive via share link.
+        GET /v1/share/{share_id}/download — download via share link.
 
-        Returns (archive_bytes, tree_hash, version).
+        Returns (format, data) tuple:
+          - v2 (JSON manifest): ("files", manifest_dict)
+          - v1 (archive):       ("archive", (archive_bytes, tree_hash, version))
         """
         data, headers = self._request(
             "GET", f"/v1/share/{share_id}/download", raw_response=True, auth=False
         )
+        ct = headers.get("Content-Type", "")
+        if "application/json" in ct:
+            manifest = json.loads(data.decode("utf-8"))
+            return ("files", manifest.get("data", manifest))
         tree_hash = headers.get("X-SkillSafe-Tree-Hash", "")
         version = headers.get("X-SkillSafe-Version", "")
-        return data, tree_hash, version
+        return ("archive", (data, tree_hash, version))
 
-    def download(self, namespace: str, name: str, version: str) -> Tuple[bytes, str]:
+    def download(self, namespace: str, name: str, version: str):
         """
-        GET /v1/skills/@{ns}/{name}/download/{version} — download an archive.
+        GET /v1/skills/@{ns}/{name}/download/{version} — download a skill version.
 
-        Returns (archive_bytes, tree_hash_from_header).
+        Returns (format, data) tuple:
+          - v2 (JSON manifest): ("files", manifest_dict)
+          - v1 (archive):       ("archive", (archive_bytes, tree_hash))
         """
         data, headers = self._request(
             "GET", f"/v1/skills/@{namespace}/{name}/download/{version}", raw_response=True
         )
+        ct = headers.get("Content-Type", "")
+        if "application/json" in ct:
+            manifest = json.loads(data.decode("utf-8"))
+            return ("files", manifest.get("data", manifest))
         tree_hash = headers.get("X-SkillSafe-Tree-Hash", "")
-        return data, tree_hash
+        return ("archive", (data, tree_hash))
 
     def verify(
         self, namespace: str, name: str, version: str, scan_report: Dict[str, Any]
@@ -855,10 +1022,181 @@ class SkillSafeClient:
         resp = self._request("GET", f"/v1/skills/@{namespace}/{name}/versions?limit={limit}", auth=False)
         return resp
 
+    def download_blob(self, blob_hash: str) -> bytes:
+        """GET /v1/blobs/{hash} — download an individual blob by content-hash."""
+        data, headers = self._request(
+            "GET", f"/v1/blobs/{blob_hash}", raw_response=True, auth=False
+        )
+        return data
+
     def get_account(self) -> Dict[str, Any]:
         """GET /v1/account — retrieve own account details (requires auth)."""
         resp = self._request("GET", "/v1/account")
         return resp.get("data", resp)
+
+
+# ---------------------------------------------------------------------------
+# V2 manifest-based install
+# ---------------------------------------------------------------------------
+
+
+def _validate_manifest_path(rel_path: str, dest_dir: Path) -> Path:
+    """Validate a manifest file path against traversal and symlink attacks.
+
+    Raises SkillSafeError if the path is unsafe (GAP-4.4, GAP-4.5).
+    Returns the resolved absolute path within dest_dir.
+    """
+    # Reject path traversal components, absolute paths, and backslashes
+    if ".." in rel_path.split("/") or rel_path.startswith("/") or "\\" in rel_path:
+        raise SkillSafeError(
+            "security_error",
+            f"Refusing to install file with unsafe path: '{rel_path}'"
+        )
+
+    # Resolve and verify the path stays inside dest_dir
+    resolved_dest = os.path.realpath(dest_dir)
+    resolved_file = os.path.realpath(os.path.join(resolved_dest, rel_path))
+    if not resolved_file.startswith(resolved_dest + os.sep) and resolved_file != resolved_dest:
+        raise SkillSafeError(
+            "security_error",
+            f"Path traversal detected: '{rel_path}' resolves outside destination"
+        )
+
+    return Path(resolved_file)
+
+
+def install_from_manifest(
+    client: SkillSafeClient,
+    manifest: dict,
+    dest_dir: Path,
+    verbose: bool = False,
+) -> Tuple[str, int, int]:
+    """Download files from a v2 manifest and reconstruct the skill directory.
+
+    Returns (tree_hash, cached_count, downloaded_count).
+    """
+    files = manifest["files"]
+    tree_hash = manifest["tree_hash"]
+    cached_count = 0
+    downloaded_count = 0
+    max_retries = 3
+
+    # Step 0: Validate all paths before downloading anything (GAP-4.4)
+    dest_dir_resolved = Path(os.path.realpath(dest_dir))
+    for f in files:
+        _validate_manifest_path(f["path"], dest_dir_resolved)
+
+    # Step 1: Download or fetch from cache each blob
+    downloaded_files: List[Dict[str, Any]] = []
+    for f in files:
+        blob_hash = f["hash"]
+        blob_path = f["path"]
+        blob_size = f["size"]
+
+        # Try local cache first
+        data = get_cached_blob(blob_hash)
+        if data is not None:
+            cached_count += 1
+            if verbose:
+                print(f"    Cache hit: {blob_path}")
+        else:
+            # Download from server with retry (GAP-4.8)
+            downloaded_count += 1
+            if verbose:
+                print(f"    Downloading: {blob_path} ({blob_size} bytes)")
+            last_err: Optional[Exception] = None
+            max_blob_retries = max_retries
+            for attempt in range(max_blob_retries):
+                try:
+                    data = client.download_blob(blob_hash)
+                    last_err = None
+                    break
+                except SkillSafeError as e:
+                    last_err = e
+                    if attempt < max_blob_retries - 1:
+                        # GAP-7.3: respect Retry-After for 429 rate limit responses
+                        if e.status == 429 and e.retry_after:
+                            wait = e.retry_after
+                            # Allow extra retries for rate limits (up to 6 total)
+                            max_blob_retries = max(max_blob_retries, 6)
+                        else:
+                            wait = 2 ** attempt  # 1s, 2s
+                        if verbose:
+                            print(f"    Retry {attempt + 1}/{max_blob_retries - 1} after {wait}s"
+                                  f"{' (rate limited)' if e.status == 429 else ''}...")
+                        time.sleep(wait)
+            if last_err is not None:
+                raise last_err
+
+            # Per-blob SHA-256 verification
+            actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+            if actual_hash != blob_hash:
+                raise SkillSafeError(
+                    "integrity_error",
+                    f"Blob hash mismatch for '{blob_path}': "
+                    f"expected {blob_hash}, got {actual_hash}"
+                )
+
+            # Cache the verified blob
+            cache_blob(blob_hash, data)
+
+        downloaded_files.append({"path": blob_path, "hash": blob_hash, "data": data})
+
+    # Step 2: Verify tree hash
+    file_manifest_for_hash = [{"path": f["path"], "hash": f["hash"]} for f in files]
+    computed_tree_hash = compute_tree_hash_v2(file_manifest_for_hash)
+    if computed_tree_hash != tree_hash:
+        raise SkillSafeError(
+            "integrity_error",
+            f"Tree hash mismatch: server={tree_hash}, computed={computed_tree_hash}"
+        )
+
+    # Step 3: Clean stale files from dest_dir (GAP-4.7)
+    # Remove files that exist in dest_dir but are not in the new manifest,
+    # so upgrades don't leave orphaned files from previous versions.
+    manifest_paths = {f["path"] for f in downloaded_files}
+    if dest_dir.exists():
+        for existing_file in list(dest_dir.rglob("*")):
+            if existing_file.is_file() or existing_file.is_symlink():
+                try:
+                    rel = existing_file.relative_to(dest_dir)
+                    rel_posix = rel.as_posix()
+                    if rel_posix not in manifest_paths:
+                        existing_file.unlink()
+                        if verbose:
+                            print(f"    Removed stale file: {rel_posix}")
+                except ValueError:
+                    pass  # Not relative to dest_dir, skip
+
+    # Step 4: Write files to dest_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for f in downloaded_files:
+        file_path = dest_dir / f["path"]
+
+        # GAP-4.5: Remove existing symlinks at destination to prevent
+        # following a symlink that writes outside dest_dir
+        if file_path.is_symlink():
+            file_path.unlink()
+
+        # Also check parent directories for symlinks escaping dest_dir
+        parent = file_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        resolved_parent = Path(os.path.realpath(parent))
+        if not str(resolved_parent).startswith(str(dest_dir_resolved) + os.sep) and resolved_parent != dest_dir_resolved:
+            raise SkillSafeError(
+                "security_error",
+                f"Symlink in parent path escapes destination for '{f['path']}'"
+            )
+
+        file_path.write_bytes(f["data"])
+
+    # Step 5: Clean up empty directories left after stale file removal
+    if dest_dir.exists():
+        for dirpath in sorted(dest_dir.rglob("*"), reverse=True):
+            if dirpath.is_dir() and not any(dirpath.iterdir()):
+                dirpath.rmdir()
+
+    return computed_tree_hash, cached_count, downloaded_count
 
 
 # ---------------------------------------------------------------------------
@@ -1198,17 +1536,18 @@ def cmd_save(args: argparse.Namespace) -> None:
 
     print(f"Saving {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    # Step 1: Create archive
-    print("  Creating archive...")
-    archive_bytes = create_archive(path)
-    size_kb = len(archive_bytes) / 1024
-    if len(archive_bytes) > MAX_ARCHIVE_SIZE:
-        print(f"Error: Archive is {size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
+    # Step 1: Build file manifest
+    print("  Building file manifest...")
+    file_manifest = build_file_manifest(path)
+    total_size = sum(f["size"] for f in file_manifest)
+    total_size_kb = total_size / 1024
+    if total_size > MAX_ARCHIVE_SIZE:
+        print(f"Error: Total file size is {total_size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
         sys.exit(1)
-    print(f"  Archive size: {size_kb:.1f} KB")
+    print(f"  Files: {len(file_manifest)}, total size: {total_size_kb:.1f} KB")
 
-    # Step 2: Compute tree hash
-    tree_hash = compute_tree_hash(archive_bytes)
+    # Step 2: Compute v2 tree hash
+    tree_hash = compute_tree_hash_v2(file_manifest)
     print(f"  Tree hash:    {dim(tree_hash[:30])}...")
 
     # Step 3: Scan (optional but recommended)
@@ -1217,8 +1556,25 @@ def cmd_save(args: argparse.Namespace) -> None:
     report = scanner.scan(path, tree_hash=tree_hash)
     _print_scan_results(report, indent=2)
 
-    # Step 4: Save to registry
-    print("\n  Uploading to registry...")
+    # Step 4: Negotiate delta upload
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    print("\n  Negotiating upload...")
+    try:
+        negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+        needed_files = negotiate_result.get("needed_files", [])
+        existing_blobs = negotiate_result.get("existing_blobs", [])
+    except SkillSafeError as e:
+        print(f"\n  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    needed_bytes = sum(f["size"] for f in file_manifest if f["path"] in needed_files)
+    print(f"  Need to upload: {len(needed_files)} file(s) ({needed_bytes / 1024:.1f} KB)")
+    if existing_blobs:
+        print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
+
+    # Step 5: Save to registry via v2
+    print("  Uploading to registry...")
     metadata: Dict[str, Any] = {"version": version}
     if description:
         metadata["description"] = description
@@ -1227,10 +1583,11 @@ def cmd_save(args: argparse.Namespace) -> None:
     if tags_raw:
         metadata["tags"] = [t.strip() for t in tags_raw.split(",")]
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
-
     try:
-        result = client.save(namespace, name, archive_bytes, metadata, scan_report_json=json.dumps(report))
+        result = client.save_v2(
+            namespace, name, metadata, file_manifest, needed_files, path,
+            scan_report_json=json.dumps(report),
+        )
     except SkillSafeError as e:
         print(f"\n  Error: {e.message}", file=sys.stderr)
         sys.exit(1)
@@ -1239,6 +1596,8 @@ def cmd_save(args: argparse.Namespace) -> None:
     print(f"  Skill ID:   {result.get('skill_id')}")
     print(f"  Version ID: {result.get('version_id')}")
     print(f"  Tree hash:  {result.get('tree_hash')}")
+    if result.get("new_bytes") is not None:
+        print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
     print(f"\n  To share this skill, run:")
     print(f"    skillsafe share @{namespace}/{name} --version {version}")
 
@@ -1292,49 +1651,69 @@ def cmd_install(args: argparse.Namespace) -> None:
 
     client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
+    # ---------- Download ----------
+
+    dl_format: str = ""       # "files" (v2) or "archive" (v1)
+    dl_data: Any = None       # manifest dict (v2) or archive bytes (v1)
+    namespace: str = ""
+    name: str = ""
+    version: str = ""
+    server_tree_hash: str = ""
+
     if share_id:
-        # Share link install path
+        # Share link download path
         print(f"Installing via share link {bold(share_id)}...\n")
 
-        print("  Downloading archive via share link...")
+        print("  Downloading via share link...")
         try:
-            archive_bytes, server_tree_hash, version = client.download_via_share(share_id)
+            dl_format, dl_data = client.download_via_share(share_id)
         except SkillSafeError as e:
             print(f"  Error: {e.message}", file=sys.stderr)
             sys.exit(1)
-        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
 
-        if not version:
-            version = "unknown"
+        if dl_format == "files":
+            # v2 manifest — extract metadata
+            namespace = dl_data.get("namespace", "shared").lstrip("@")
+            name = dl_data.get("name", share_id)
+            version = dl_data.get("version", "unknown")
+            print(f"  Received v2 manifest: {len(dl_data.get('files', []))} file(s)")
+        else:
+            # v1 archive
+            archive_bytes, server_tree_hash, version = dl_data
+            print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+            dl_data = archive_bytes  # normalize
 
-        # Try to extract namespace/name from archive's SKILL.md
-        namespace = "shared"
-        name = share_id
-        try:
-            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                for member in tar.getmembers():
-                    if member.name == "SKILL.md" or member.name.endswith("/SKILL.md"):
-                        f = tar.extractfile(member)
-                        if f:
-                            text = f.read().decode("utf-8", errors="replace")
-                            for line in text.splitlines():
-                                if line.startswith("name:"):
-                                    name = line[len("name:"):].strip()
-                                    break
-                        break
-        except Exception:
-            pass  # Use defaults if we can't parse SKILL.md
+            if not version:
+                version = "unknown"
+
+            # Try to extract namespace/name from archive's SKILL.md
+            namespace = "shared"
+            name = share_id
+            try:
+                with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                    for member in tar.getmembers():
+                        if member.name == "SKILL.md" or member.name.endswith("/SKILL.md"):
+                            f = tar.extractfile(member)
+                            if f:
+                                text = f.read().decode("utf-8", errors="replace")
+                                for line in text.splitlines():
+                                    if line.startswith("name:"):
+                                        name = line[len("name:"):].strip()
+                                        break
+                            break
+            except Exception:
+                pass  # Use defaults if we can't parse SKILL.md
 
     else:
         namespace, name = parse_skill_ref(skill_ref)
-        version = getattr(args, "version", None)
+        version = getattr(args, "version", None) or ""
 
         # Step 1: Resolve version
         if not version:
             print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
             try:
                 meta = client.get_metadata(namespace, name, auth=True)
-                version = meta.get("latest_version")
+                version = meta.get("latest_version", "")
                 if not version:
                     print("Error: No published versions found.", file=sys.stderr)
                     sys.exit(1)
@@ -1351,58 +1730,123 @@ def cmd_install(args: argparse.Namespace) -> None:
         print(f"Installing {bold(f'@{namespace}/{name}')} v{version}...\n")
 
         # Step 2: Download
-        print("  Downloading archive...")
+        print("  Downloading...")
         try:
-            archive_bytes, server_tree_hash = client.download(namespace, name, version)
+            dl_format, dl_data = client.download(namespace, name, version)
         except SkillSafeError as e:
             print(f"  Error: {e.message}", file=sys.stderr)
             sys.exit(1)
-        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
 
-    # Step 3: Verify tree hash
-    local_tree_hash = compute_tree_hash(archive_bytes)
-    if not server_tree_hash:
-        print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
-        print("Aborting installation for safety.", file=sys.stderr)
-        sys.exit(1)
-    if local_tree_hash != server_tree_hash:
-        print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
-        print(f"    Server:  {server_tree_hash}")
-        print(f"    Local:   {local_tree_hash}")
-        print("  Aborting installation.")
-        sys.exit(1)
-    print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+        if dl_format == "files":
+            print(f"  Received v2 manifest: {len(dl_data.get('files', []))} file(s)")
+        else:
+            archive_bytes, server_tree_hash = dl_data
+            dl_data = archive_bytes  # normalize
+            print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
 
-    # Step 4: Extract to temp dir and scan
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmppath = Path(tmpdir)
-        print("  Extracting archive...")
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=tmppath, filter="data")
+    # ---------- V2 path (file manifest) ----------
 
-        print("  Scanning downloaded skill...")
-        scanner = Scanner()
-        consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-        _print_scan_results(consumer_report, indent=2)
+    if dl_format == "files":
+        manifest = dl_data
 
-    # Step 5: Submit verification
-    print("\n  Submitting verification report...")
+        # Reconstruct into a temp dir, scan, then move to final location
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Reconstructing skill from manifest...")
+            try:
+                local_tree_hash, cached_count, downloaded_count = install_from_manifest(
+                    client, manifest, tmppath, verbose=True
+                )
+            except SkillSafeError as e:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"  Files: {downloaded_count} downloaded, {cached_count} from cache")
+            print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+
+            # Scan reconstructed skill
+            print("  Scanning downloaded skill...")
+            scanner = Scanner()
+            consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(consumer_report, indent=2)
+
+            # Submit verification
+            print("\n  Submitting verification report...")
+            verdict, details = _submit_verification(client, namespace, name, version, consumer_report)
+
+            # Display verdict and prompt
+            if not _handle_verdict(verdict, details):
+                return
+
+            # Install to final location
+            _install_to_target(args, namespace, name, version, local_tree_hash, source_dir=tmppath)
+
+    # ---------- V1 path (archive) ----------
+
+    else:
+        archive_bytes = dl_data
+
+        # Verify tree hash
+        local_tree_hash = compute_tree_hash(archive_bytes)
+        if not server_tree_hash:
+            print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
+            print("Aborting installation for safety.", file=sys.stderr)
+            sys.exit(1)
+        if local_tree_hash != server_tree_hash:
+            print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
+            print(f"    Server:  {server_tree_hash}")
+            print(f"    Local:   {local_tree_hash}")
+            print("  Aborting installation.")
+            sys.exit(1)
+        print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+
+        # Extract to temp dir and scan
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Extracting archive...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                tar.extractall(path=tmppath, filter="data")
+
+            print("  Scanning downloaded skill...")
+            scanner = Scanner()
+            consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(consumer_report, indent=2)
+
+        # Submit verification
+        print("\n  Submitting verification report...")
+        verdict, details = _submit_verification(client, namespace, name, version, consumer_report)
+
+        # Display verdict and prompt
+        if not _handle_verdict(verdict, details):
+            return
+
+        # Install to final location (from archive)
+        _install_to_target_archive(args, namespace, name, version, local_tree_hash, archive_bytes)
+
+
+def _submit_verification(
+    client: SkillSafeClient,
+    namespace: str,
+    name: str,
+    version: str,
+    consumer_report: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Submit a consumer verification report. Returns (verdict, details)."""
     try:
         verdict_result = client.verify(namespace, name, version, consumer_report)
-        verdict = verdict_result.get("verdict", "unknown")
-        details = verdict_result.get("details", {})
+        return verdict_result.get("verdict", "unknown"), verdict_result.get("details", {})
     except SkillSafeError as e:
         if e.status == 403:
-            # Expected for self-verify scenarios
             print(f"  Verification skipped: {e.message}")
-            verdict = "skipped"
+            return "skipped", {}
         else:
             print(f"  Warning: Verification failed due to error: {e.message}", file=sys.stderr)
             print("  Continuing without verification.", file=sys.stderr)
-            verdict = "error"
-        details = {}
+            return "error", {}
 
-    # Step 6: Display verdict and prompt
+
+def _handle_verdict(verdict: str, details: Dict[str, Any]) -> bool:
+    """Display verification verdict. Returns True to proceed, False to cancel."""
     if verdict == "verified":
         print(green("  Verified: publisher and consumer scans match."))
     elif verdict == "divergent":
@@ -1419,7 +1863,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("  Non-interactive mode: skipping divergent skill.")
         if answer != "y":
             print("  Installation cancelled.")
-            return
+            return False
     elif verdict == "critical":
         print(red("  CRITICAL: Tree hash mismatch detected by server!"))
         for key, val in details.items():
@@ -1430,26 +1874,84 @@ def cmd_install(args: argparse.Namespace) -> None:
         pass  # Already printed reason above
     else:
         print(f"  Verdict: {verdict}")
+    return True
 
-    # Step 7: Install to skills directory
+
+def _install_to_target(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+    source_dir: Path,
+) -> None:
+    """Copy files from source_dir to the final install location."""
     skills_dir = _resolve_skills_dir(args)
 
     if skills_dir:
-        # Install directly into an agent's skills directory
         install_dir = skills_dir / name
         install_dir.mkdir(parents=True, exist_ok=True)
-
         print(f"\n  Installing to {install_dir}...")
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=install_dir, filter="data")
-
+        # Copy all files from source_dir to install_dir
+        for item in source_dir.iterdir():
+            dest = install_dir / item.name
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
     else:
-        # Install to ~/.skillsafe/skills/@ns/name/version/
         install_dir = SKILLS_DIR / f"@{namespace}" / name / version
         install_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Installing to {install_dir}...")
+        for item in source_dir.iterdir():
+            dest = install_dir / item.name
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
 
+        # Update 'current' symlink
+        current_link = install_dir.parent / "current"
+        if current_link.is_symlink() or current_link.exists():
+            current_link.unlink()
+        if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.]+)?$', version):
+            print(red(f"  Invalid version format: {version}"))
+            return
+        current_link.symlink_to(version)
+        print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+        print(f"  Location: {install_dir}")
+
+    _update_lockfile(namespace, name, version, tree_hash)
+
+
+def _install_to_target_archive(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+    archive_bytes: bytes,
+) -> None:
+    """Extract a v1 archive to the final install location."""
+    skills_dir = _resolve_skills_dir(args)
+
+    if skills_dir:
+        install_dir = skills_dir / name
+        install_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n  Installing to {install_dir}...")
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+            tar.extractall(path=install_dir, filter="data")
+        print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+        print(f"  Location: {install_dir}")
+    else:
+        install_dir = SKILLS_DIR / f"@{namespace}" / name / version
+        install_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Installing to {install_dir}...")
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
             tar.extractall(path=install_dir, filter="data")
@@ -1462,12 +1964,10 @@ def cmd_install(args: argparse.Namespace) -> None:
             print(red(f"  Invalid version format: {version}"))
             return
         current_link.symlink_to(version)
-
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
-    # Update lockfile if in a project directory
-    _update_lockfile(namespace, name, version, local_tree_hash)
+    _update_lockfile(namespace, name, version, tree_hash)
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -1696,18 +2196,19 @@ def cmd_backup(args: argparse.Namespace) -> None:
         version = client.resolve_next_version(namespace, name)
     print(f"Backing up {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    # Step 2: Create archive
-    print("  Creating archive...")
-    archive_bytes = create_archive(skill_path)
-    size_kb = len(archive_bytes) / 1024
+    # Step 2: Build file manifest
+    print("  Building file manifest...")
+    file_manifest = build_file_manifest(skill_path)
+    total_size = sum(f["size"] for f in file_manifest)
+    total_size_kb = total_size / 1024
 
-    if len(archive_bytes) > MAX_ARCHIVE_SIZE:
-        print(f"Error: Archive is {size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
+    if total_size > MAX_ARCHIVE_SIZE:
+        print(f"Error: Total file size is {total_size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
         sys.exit(1)
-    print(f"  Archive size: {size_kb:.1f} KB")
+    print(f"  Files: {len(file_manifest)}, total size: {total_size_kb:.1f} KB")
 
-    # Step 3: Compute tree hash
-    tree_hash = compute_tree_hash(archive_bytes)
+    # Step 3: Compute v2 tree hash
+    tree_hash = compute_tree_hash_v2(file_manifest)
     print(f"  Tree hash:    {dim(tree_hash[:30])}...")
 
     # Step 4: Scan
@@ -1716,20 +2217,48 @@ def cmd_backup(args: argparse.Namespace) -> None:
     report = scanner.scan(skill_path, tree_hash=tree_hash)
     _print_scan_results(report, indent=2)
 
-    # Step 5: Save to registry
-    print("\n  Uploading to registry...")
+    # Step 5: Negotiate delta upload
+    print("\n  Negotiating upload...")
+    try:
+        negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+        needed_files = negotiate_result.get("needed_files", [])
+        existing_blobs = negotiate_result.get("existing_blobs", [])
+    except SkillSafeError as e:
+        print(f"\n  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    needed_bytes = sum(f["size"] for f in file_manifest if f["path"] in needed_files)
+    print(f"  Need to upload: {len(needed_files)} file(s) ({needed_bytes / 1024:.1f} KB)")
+    if existing_blobs:
+        print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
+
+    # Step 6: Save to registry via v2
+    print("  Uploading to registry...")
     metadata: Dict[str, Any] = {"version": version}
 
     try:
-        result = client.save(namespace, name, archive_bytes, metadata, scan_report_json=json.dumps(report))
+        result = client.save_v2(
+            namespace, name, metadata, file_manifest, needed_files, skill_path,
+            scan_report_json=json.dumps(report),
+        )
     except SkillSafeError as e:
         # Handle version collision: re-resolve and retry once
         if e.status == 409 or e.status == 422:
             print(f"  Version {version} conflict, re-resolving...")
             version = client.resolve_next_version(namespace, name)
             metadata["version"] = version
+            # Re-negotiate with new version (needed_files may differ)
             try:
-                result = client.save(namespace, name, archive_bytes, metadata, scan_report_json=json.dumps(report))
+                negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+                needed_files = negotiate_result.get("needed_files", [])
+            except SkillSafeError as e_neg:
+                print(f"\n  Error: {e_neg.message}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                result = client.save_v2(
+                    namespace, name, metadata, file_manifest, needed_files, skill_path,
+                    scan_report_json=json.dumps(report),
+                )
             except SkillSafeError as e2:
                 print(f"\n  Error: {e2.message}", file=sys.stderr)
                 sys.exit(1)
@@ -1744,6 +2273,8 @@ def cmd_backup(args: argparse.Namespace) -> None:
     print(f"  Skill ID:   {result.get('skill_id')}")
     print(f"  Version ID: {result.get('version_id')}")
     print(f"  Tree hash:  {result.get('tree_hash')}")
+    if result.get("new_bytes") is not None:
+        print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
     print(f"  Restore with: skillsafe restore @{namespace}/{name}")
 
 
@@ -1789,7 +2320,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         print(f"  Downloading v{version} from registry...")
-        archive_bytes, server_tree_hash = client.download(namespace, skill_name, version)
+        dl_format, dl_data = client.download(namespace, skill_name, version)
     except SkillSafeError as e:
         print(f"  Error: {e.message}", file=sys.stderr)
         sys.exit(1)
@@ -1797,61 +2328,127 @@ def cmd_restore(args: argparse.Namespace) -> None:
         print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Verify tree hash
-    local_tree_hash = compute_tree_hash(archive_bytes)
-    if not server_tree_hash:
-        print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
-        print("Aborting restore for safety.", file=sys.stderr)
-        sys.exit(1)
-    if local_tree_hash != server_tree_hash:
-        print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
-        print(f"    Server:  {server_tree_hash}")
-        print(f"    Local:   {local_tree_hash}")
-        print("  Aborting restore.")
-        sys.exit(1)
-    print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
-    print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+    # ---------- V2 path (file manifest) ----------
 
-    # Extract to temp dir and scan before moving to target
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmppath = Path(tmpdir)
-        print("  Extracting to temporary directory...")
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=tmppath, filter="data")
+    if dl_format == "files":
+        manifest = dl_data
+        print(f"  Received v2 manifest: {len(manifest.get('files', []))} file(s)")
 
-        # Scan restored files for security issues (warn but don't block)
-        print("  Scanning restored skill...")
-        scanner = Scanner()
-        scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-        _print_scan_results(scan_report, indent=2)
-
-        if not scan_report.get("clean", True):
-            print(yellow("\n  WARNING: Security issues found in restored skill."))
-
-        # Submit verification report (dual-side verification)
-        print("\n  Submitting verification report...")
-        try:
-            verify_resp = client.verify(namespace, skill_name, version, scan_report)
-            verify_verdict = verify_resp.get("verdict", "unknown")
-            if verify_verdict == "verified":
-                print(green("  Verified: publisher and consumer scans match."))
-            elif verify_verdict == "critical":
-                print(red("  CRITICAL: Tree hash mismatch detected by server!"))
-                print("  Aborting restore.")
+        # Reconstruct into temp dir, scan, then copy to target
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Reconstructing skill from manifest...")
+            try:
+                local_tree_hash, cached_count, downloaded_count = install_from_manifest(
+                    client, manifest, tmppath, verbose=True
+                )
+            except SkillSafeError as e:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
                 sys.exit(1)
-            elif verify_verdict == "divergent":
-                print(yellow("  WARNING: Scan reports diverge."))
-        except SkillSafeError as e:
-            if e.status == 403:
-                pass  # Expected for self-restore
-            else:
-                print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
 
-        # Extract to final target directory
-        target_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  Extracting to {target_dir}...")
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=target_dir, filter="data")
+            print(f"  Files: {downloaded_count} downloaded, {cached_count} from cache")
+            print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+
+            # Scan restored files
+            print("  Scanning restored skill...")
+            scanner = Scanner()
+            scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(scan_report, indent=2)
+
+            if not scan_report.get("clean", True):
+                print(yellow("\n  WARNING: Security issues found in restored skill."))
+
+            # Submit verification
+            print("\n  Submitting verification report...")
+            try:
+                verify_resp = client.verify(namespace, skill_name, version, scan_report)
+                verify_verdict = verify_resp.get("verdict", "unknown")
+                if verify_verdict == "verified":
+                    print(green("  Verified: publisher and consumer scans match."))
+                elif verify_verdict == "critical":
+                    print(red("  CRITICAL: Tree hash mismatch detected by server!"))
+                    print("  Aborting restore.")
+                    sys.exit(1)
+                elif verify_verdict == "divergent":
+                    print(yellow("  WARNING: Scan reports diverge."))
+            except SkillSafeError as e:
+                if e.status == 403:
+                    pass  # Expected for self-restore
+                else:
+                    print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
+
+            # Copy to final target directory
+            target_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  Copying to {target_dir}...")
+            for item in tmppath.iterdir():
+                dest = target_dir / item.name
+                if item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+
+    # ---------- V1 path (archive) ----------
+
+    else:
+        archive_bytes, server_tree_hash = dl_data
+
+        # Verify tree hash
+        local_tree_hash = compute_tree_hash(archive_bytes)
+        if not server_tree_hash:
+            print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
+            print("Aborting restore for safety.", file=sys.stderr)
+            sys.exit(1)
+        if local_tree_hash != server_tree_hash:
+            print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
+            print(f"    Server:  {server_tree_hash}")
+            print(f"    Local:   {local_tree_hash}")
+            print("  Aborting restore.")
+            sys.exit(1)
+        print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+
+        # Extract to temp dir and scan before moving to target
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Extracting to temporary directory...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                tar.extractall(path=tmppath, filter="data")
+
+            # Scan restored files for security issues (warn but don't block)
+            print("  Scanning restored skill...")
+            scanner = Scanner()
+            scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(scan_report, indent=2)
+
+            if not scan_report.get("clean", True):
+                print(yellow("\n  WARNING: Security issues found in restored skill."))
+
+            # Submit verification report (dual-side verification)
+            print("\n  Submitting verification report...")
+            try:
+                verify_resp = client.verify(namespace, skill_name, version, scan_report)
+                verify_verdict = verify_resp.get("verdict", "unknown")
+                if verify_verdict == "verified":
+                    print(green("  Verified: publisher and consumer scans match."))
+                elif verify_verdict == "critical":
+                    print(red("  CRITICAL: Tree hash mismatch detected by server!"))
+                    print("  Aborting restore.")
+                    sys.exit(1)
+                elif verify_verdict == "divergent":
+                    print(yellow("  WARNING: Scan reports diverge."))
+            except SkillSafeError as e:
+                if e.status == 403:
+                    pass  # Expected for self-restore
+                else:
+                    print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
+
+            # Extract to final target directory
+            target_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  Extracting to {target_dir}...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                tar.extractall(path=target_dir, filter="data")
 
     print(green(f"\n  Restored @{namespace}/{skill_name}"))
     print(f"  Location: {target_dir}")
