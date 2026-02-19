@@ -52,9 +52,35 @@ from typing import Any, Dict, List, Optional, Tuple
 # Python version guard
 # ---------------------------------------------------------------------------
 
-if sys.version_info < (3, 12):
-    print("Error: Python 3.12+ is required (for tarfile security filters).", file=sys.stderr)
+if sys.version_info < (3, 9):
+    print("Error: Python 3.9+ is required.", file=sys.stderr)
     sys.exit(1)
+
+
+def _safe_extractall(tar: tarfile.TarFile, path: str) -> None:
+    """Extract tarfile safely.  Uses the ``filter="data"`` parameter on
+    Python 3.12+ (which blocks absolute paths, traversals, and special
+    members).  On older Pythons we apply equivalent manual checks."""
+    if sys.version_info >= (3, 12):
+        tar.extractall(path=path, filter="data")
+    else:
+        # Manual safety: reject absolute paths, traversals, and
+        # special file types (devices, fifos, etc.)
+        dest = os.path.realpath(path)
+        for member in tar.getmembers():
+            member_path = os.path.normpath(member.name)
+            if member_path.startswith("/") or member_path.startswith("..") or "/../" in member_path:
+                raise tarfile.TarError(f"Path traversal in archive: {member.name}")
+            resolved = os.path.realpath(os.path.join(dest, member_path))
+            if not resolved.startswith(dest + os.sep) and resolved != dest:
+                raise tarfile.TarError(f"Path escapes destination: {member.name}")
+            if member.islnk() or member.issym():
+                link_target = os.path.realpath(os.path.join(dest, os.path.dirname(member_path), member.linkname))
+                if not link_target.startswith(dest + os.sep) and link_target != dest:
+                    raise tarfile.TarError(f"Symlink escapes destination: {member.name} -> {member.linkname}")
+            if not (member.isfile() or member.isdir() or member.issym()):
+                raise tarfile.TarError(f"Blocked special member: {member.name}")
+        tar.extractall(path=path)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1805,7 +1831,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             tmppath = Path(tmpdir)
             print("  Extracting archive...")
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                tar.extractall(path=tmppath, filter="data")
+                _safe_extractall(tar, tmppath)
 
             print("  Scanning downloaded skill...")
             scanner = Scanner()
@@ -1946,7 +1972,7 @@ def _install_to_target_archive(
         install_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Installing to {install_dir}...")
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=install_dir, filter="data")
+            _safe_extractall(tar, install_dir)
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
     else:
@@ -1954,7 +1980,7 @@ def _install_to_target_archive(
         install_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n  Installing to {install_dir}...")
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-            tar.extractall(path=install_dir, filter="data")
+            _safe_extractall(tar, install_dir)
 
         # Update 'current' symlink
         current_link = install_dir.parent / "current"
@@ -2414,7 +2440,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
             tmppath = Path(tmpdir)
             print("  Extracting to temporary directory...")
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                tar.extractall(path=tmppath, filter="data")
+                _safe_extractall(tar, tmppath)
 
             # Scan restored files for security issues (warn but don't block)
             print("  Scanning restored skill...")
@@ -2448,7 +2474,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
             target_dir.mkdir(parents=True, exist_ok=True)
             print(f"  Extracting to {target_dir}...")
             with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                tar.extractall(path=target_dir, filter="data")
+                _safe_extractall(tar, target_dir)
 
     print(green(f"\n  Restored @{namespace}/{skill_name}"))
     print(f"  Location: {target_dir}")

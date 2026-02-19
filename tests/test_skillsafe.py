@@ -2127,12 +2127,12 @@ class _CmdTestBase(unittest.TestCase):
     @staticmethod
     def _patch_extractall():
         """Return a mock.patch for tarfile.TarFile.extractall that strips
-        the ``filter`` kwarg, which is only available on Python 3.12+.
-        This lets us run tests on older Pythons without errors."""
+        the ``filter`` kwarg on Python < 3.12.  The CLI itself now handles
+        this via ``_safe_extractall``, but this patch is still useful for
+        tests that may invoke extractall directly in mocked scenarios."""
         _real_extractall = tarfile.TarFile.extractall
 
         def _compat_extractall(self_tar, path=".", members=None, *, numeric_owner=False, **kwargs):
-            # Drop the ``filter`` kwarg that Python <3.12 doesn't understand
             kwargs.pop("filter", None)
             return _real_extractall(self_tar, path=path, members=members, numeric_owner=numeric_owner)
 
