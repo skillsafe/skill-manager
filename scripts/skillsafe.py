@@ -1558,8 +1558,8 @@ def cmd_save(args: argparse.Namespace) -> None:
     _validate_skill_name(name)
 
     if name in RESERVED_SKILL_NAMES:
-        print(f"Error: '{name}' is a reserved name and cannot be used as a skill name.", file=sys.stderr)
-        sys.exit(1)
+        print(f"  '{name}' is reserved and has no need to save.")
+        return
 
     print(f"Saving {bold(f'@{namespace}/{name}')} v{version}...\n")
 
@@ -2211,8 +2211,8 @@ def cmd_backup(args: argparse.Namespace) -> None:
     _validate_skill_name(name)
 
     if name in RESERVED_SKILL_NAMES:
-        print(f"Error: '{name}' is a reserved name and cannot be used as a skill name.", file=sys.stderr)
-        sys.exit(1)
+        print(f"  '{name}' is reserved and has no need to backup.")
+        return
 
     client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
@@ -2237,6 +2237,20 @@ def cmd_backup(args: argparse.Namespace) -> None:
     # Step 3: Compute v2 tree hash
     tree_hash = compute_tree_hash_v2(file_manifest)
     print(f"  Tree hash:    {dim(tree_hash[:30])}...")
+
+    # Step 3b: Check if latest version already has the same tree hash (no changes)
+    try:
+        meta = client.get_metadata(namespace, name, auth=True)
+        latest_ver = meta.get("latest_version")
+        if latest_ver:
+            versions_resp = client.get_versions(namespace, name, limit=1)
+            versions = versions_resp.get("data", versions_resp).get("versions", [])
+            if versions and versions[0].get("tree_hash") == tree_hash:
+                print(green(f"\n  No changes detected — latest version v{latest_ver} already has the same content."))
+                print(f"  Skipping backup.")
+                return
+    except SkillSafeError:
+        pass  # Skill doesn't exist yet, proceed with first backup
 
     # Step 4: Scan
     print("  Scanning for security issues...")
