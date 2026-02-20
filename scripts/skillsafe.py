@@ -642,7 +642,7 @@ def build_file_manifest(path: Path) -> list[dict]:
             file_hash = "sha256:" + hashlib.sha256(content).hexdigest()
             files.append({"path": rel, "hash": file_hash, "size": len(content)})
 
-    MAX_FILE_COUNT = 5000
+    MAX_FILE_COUNT = 1000
     if len(files) > MAX_FILE_COUNT:
         raise SkillSafeError("too_many_files", f"Too many files ({len(files)}). Maximum is {MAX_FILE_COUNT}.")
 
@@ -708,7 +708,7 @@ def create_archive(path: Path) -> bytes:
                     continue
                 entries.append(Path(dirpath) / fname)
 
-        MAX_FILE_COUNT = 5000
+        MAX_FILE_COUNT = 1000
         if len(entries) > MAX_FILE_COUNT:
             raise SkillSafeError("too_many_files", f"Too many files ({len(entries)}). Maximum is {MAX_FILE_COUNT}.")
 
@@ -1610,19 +1610,63 @@ def cmd_save(args: argparse.Namespace) -> None:
     if tags_raw:
         metadata["tags"] = [t.strip() for t in tags_raw.split(",")]
 
-    try:
-        result = client.save_v2(
-            namespace, name, metadata, file_manifest, needed_files, path,
-            scan_report_json=json.dumps(report),
-        )
-    except SkillSafeError as e:
-        print(f"\n  Error: {e.message}", file=sys.stderr)
-        sys.exit(1)
+    max_retries = 3
+    result = None
+    for attempt in range(max_retries):
+        try:
+            result = client.save_v2(
+                namespace, name, metadata, file_manifest, needed_files, path,
+                scan_report_json=json.dumps(report),
+            )
+            break  # Success
+        except SkillSafeError as e:
+            # 409 Conflict: version already exists (previous attempt succeeded but response was lost)
+            if e.status == 409 or e.code == "conflict":
+                print(yellow(f"\n  Version {version} already exists (likely saved on previous attempt)."))
+                sys.exit(0)
+            # 429 Rate Limit: respect Retry-After
+            if e.status == 429 and e.retry_after and attempt < max_retries - 1:
+                print(yellow(f"\n  Rate limited, retrying in {e.retry_after}s..."))
+                time.sleep(e.retry_after)
+                continue
+            # Non-retryable client errors (4xx except 429)
+            if 400 <= e.status < 500:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+            # Retryable server errors (5xx) or unknown
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({e.code}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({type(e).__name__}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: {e}", file=sys.stderr)
+                sys.exit(1)
 
-    print(green(f"\n  Saved @{namespace}/{name}@{version}"))
-    print(f"  Skill ID:   {result.get('skill_id')}")
-    print(f"  Version ID: {result.get('version_id')}")
-    print(f"  Tree hash:  {result.get('tree_hash')}")
+    # Post-upload tree hash verification
+    server_tree_hash = result.get("tree_hash")
+    local_tree_hash = compute_tree_hash_v2(file_manifest)
+
+    if server_tree_hash != local_tree_hash:
+        print(yellow(f"\n  Warning: Tree hash mismatch!"))
+        print(f"    Local:  {local_tree_hash}")
+        print(f"    Server: {server_tree_hash}")
+        print(f"  This may indicate server processing issues or tampering.")
+        print(f"\n  Saved @{namespace}/{name}@{version}")
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+    else:
+        print(green(f"\n  Saved @{namespace}/{name}@{version}"))
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+        print(f"  Tree hash:  {server_tree_hash} (verified)")
     if result.get("new_bytes") is not None:
         print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
     print(f"\n  To share this skill, run:")
@@ -2273,47 +2317,78 @@ def cmd_backup(args: argparse.Namespace) -> None:
     if existing_blobs:
         print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
 
-    # Step 6: Save to registry via v2
+    # Step 6: Save to registry via v2 (with retry)
     print("  Uploading to registry...")
     metadata: Dict[str, Any] = {"version": version}
 
-    try:
-        result = client.save_v2(
-            namespace, name, metadata, file_manifest, needed_files, skill_path,
-            scan_report_json=json.dumps(report),
-        )
-    except SkillSafeError as e:
-        # Handle version collision: re-resolve and retry once
-        if e.status == 409 or e.status == 422:
-            print(f"  Version {version} conflict, re-resolving...")
-            version = client.resolve_next_version(namespace, name)
-            metadata["version"] = version
-            # Re-negotiate with new version (needed_files may differ)
-            try:
-                negotiate_result = client.negotiate(namespace, name, version, file_manifest)
-                needed_files = negotiate_result.get("needed_files", [])
-            except SkillSafeError as e_neg:
-                print(f"\n  Error: {e_neg.message}", file=sys.stderr)
+    max_retries = 3
+    result = None
+    version_resolved = False
+    for attempt in range(max_retries):
+        try:
+            result = client.save_v2(
+                namespace, name, metadata, file_manifest, needed_files, skill_path,
+                scan_report_json=json.dumps(report),
+            )
+            break  # Success
+        except SkillSafeError as e:
+            # Handle version collision: re-resolve version and retry once
+            if (e.status == 409 or e.status == 422) and not version_resolved:
+                version_resolved = True
+                print(f"  Version {version} conflict, re-resolving...")
+                version = client.resolve_next_version(namespace, name)
+                metadata["version"] = version
+                # Re-negotiate with new version (needed_files may differ)
+                try:
+                    negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+                    needed_files = negotiate_result.get("needed_files", [])
+                except SkillSafeError as e_neg:
+                    print(f"\n  Error: {e_neg.message}", file=sys.stderr)
+                    sys.exit(1)
+                continue
+            # 429 Rate Limit: respect Retry-After
+            if e.status == 429 and e.retry_after and attempt < max_retries - 1:
+                print(yellow(f"\n  Rate limited, retrying in {e.retry_after}s..."))
+                time.sleep(e.retry_after)
+                continue
+            # Non-retryable client errors (4xx except 429)
+            if 400 <= e.status < 500:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
                 sys.exit(1)
-            try:
-                result = client.save_v2(
-                    namespace, name, metadata, file_manifest, needed_files, skill_path,
-                    scan_report_json=json.dumps(report),
-                )
-            except SkillSafeError as e2:
-                print(f"\n  Error: {e2.message}", file=sys.stderr)
+            # Retryable server errors (5xx) or unknown
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({e.code}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
                 sys.exit(1)
-        else:
-            print(f"\n  Error: {e.message}", file=sys.stderr)
-            sys.exit(1)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
-        sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({type(e).__name__}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
+                sys.exit(1)
 
-    print(green(f"\n  Backed up @{namespace}/{name}@{version}"))
-    print(f"  Skill ID:   {result.get('skill_id')}")
-    print(f"  Version ID: {result.get('version_id')}")
-    print(f"  Tree hash:  {result.get('tree_hash')}")
+    # Post-upload tree hash verification
+    server_tree_hash = result.get("tree_hash")
+    local_tree_hash = compute_tree_hash_v2(file_manifest)
+
+    if server_tree_hash != local_tree_hash:
+        print(yellow(f"\n  Warning: Tree hash mismatch!"))
+        print(f"    Local:  {local_tree_hash}")
+        print(f"    Server: {server_tree_hash}")
+        print(f"  This may indicate server processing issues or tampering.")
+        print(f"\n  Backed up @{namespace}/{name}@{version}")
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+    else:
+        print(green(f"\n  Backed up @{namespace}/{name}@{version}"))
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+        print(f"  Tree hash:  {server_tree_hash} (verified)")
     if result.get("new_bytes") is not None:
         print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
     print(f"  Restore with: skillsafe restore @{namespace}/{name}")
