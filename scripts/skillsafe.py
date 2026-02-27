@@ -498,7 +498,7 @@ class Scanner:
                 # Fall through to scan the remainder
 
             for pattern, rule_id, severity, message in self._JS_COMPILED:
-                if pattern.search(line):
+                if pattern.search(stripped):
                     findings.append({
                         "rule_id": rule_id,
                         "severity": severity,

@@ -446,18 +446,22 @@ class TestSkillSafeClientDownload(unittest.TestCase):
 
     @mock.patch.object(skillsafe.SkillSafeClient, "_request")
     def test_download_success(self, mock_req):
-        mock_headers = {"X-SkillSafe-Tree-Hash": "sha256:abc123"}
+        mock_headers = {"X-SkillSafe-Tree-Hash": "sha256:abc123", "Content-Type": "application/gzip"}
         mock_req.return_value = (b"archive_data", mock_headers)
-        data, tree_hash = self.client.download("alice", "myskill", "1.0.0")
+        fmt, dl_data = self.client.download("alice", "myskill", "1.0.0")
+        self.assertEqual(fmt, "archive")
+        data, tree_hash = dl_data
         self.assertEqual(data, b"archive_data")
         self.assertEqual(tree_hash, "sha256:abc123")
 
     @mock.patch.object(skillsafe.SkillSafeClient, "_request")
     def test_download_missing_tree_hash_header(self, mock_req):
         """Audit #9: empty tree hash from server."""
-        mock_headers = {}
+        mock_headers = {"Content-Type": "application/gzip"}
         mock_req.return_value = (b"archive_data", mock_headers)
-        data, tree_hash = self.client.download("alice", "myskill", "1.0.0")
+        fmt, dl_data = self.client.download("alice", "myskill", "1.0.0")
+        self.assertEqual(fmt, "archive")
+        data, tree_hash = dl_data
         self.assertEqual(tree_hash, "")
 
     @mock.patch.object(skillsafe.SkillSafeClient, "_request")
@@ -465,9 +469,12 @@ class TestSkillSafeClientDownload(unittest.TestCase):
         mock_headers = {
             "X-SkillSafe-Tree-Hash": "sha256:def",
             "X-SkillSafe-Version": "2.0.0",
+            "Content-Type": "application/gzip",
         }
         mock_req.return_value = (b"share_data", mock_headers)
-        data, tree_hash, version = self.client.download_via_share("shr_abc123")
+        fmt, dl_data = self.client.download_via_share("shr_abc123")
+        self.assertEqual(fmt, "archive")
+        data, tree_hash, version = dl_data
         self.assertEqual(data, b"share_data")
         self.assertEqual(tree_hash, "sha256:def")
         self.assertEqual(version, "2.0.0")
@@ -1045,9 +1052,11 @@ class TestCmdSave(unittest.TestCase):
         skillsafe.CONFIG_FILE = self._orig_config_file
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_save_success(self, mock_save):
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
+    def test_save_success(self, mock_negotiate, mock_save_v2):
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(
             path=str(self.skill_dir),
             version="1.0.0",
@@ -1056,7 +1065,7 @@ class TestCmdSave(unittest.TestCase):
             tags=None,
         )
         skillsafe.cmd_save(args)
-        mock_save.assert_called_once()
+        mock_save_v2.assert_called_once()
 
     def test_invalid_version_exits(self):
         args = _mock_args(path=str(self.skill_dir), version="bad", description=None, category=None, tags=None)
@@ -1068,42 +1077,46 @@ class TestCmdSave(unittest.TestCase):
         with self.assertRaises(SystemExit):
             skillsafe.cmd_save(args)
 
-    def test_reserved_name_exits_with_error(self):
-        """Audit #7 fix: reserved name prints error and exits with code 1."""
+    def test_reserved_name_returns_early(self):
+        """Reserved name prints message and returns (does not exit)."""
         reserved_dir = Path(self.tmpdir) / "skillsafe"
         reserved_dir.mkdir()
         (reserved_dir / "SKILL.md").write_text("# Skill\n")
         args = _mock_args(path=str(reserved_dir), version="1.0.0", description=None, category=None, tags=None)
-        with mock.patch.object(skillsafe.SkillSafeClient, "save") as mock_save:
-            with self.assertRaises(SystemExit) as ctx:
+        with mock.patch.object(skillsafe.SkillSafeClient, "save_v2") as mock_save_v2:
+            with mock.patch("builtins.print") as mock_print:
                 skillsafe.cmd_save(args)
-            self.assertEqual(ctx.exception.code, 1)
-            mock_save.assert_not_called()
+            mock_save_v2.assert_not_called()
+            output = " ".join(str(c) for c in mock_print.call_args_list)
+            self.assertIn("reserved", output)
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_name_from_directory(self, mock_save):
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
+    def test_name_from_directory(self, mock_negotiate, mock_save_v2):
         """Audit #4: name derived from directory name without validation."""
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(path=str(self.skill_dir), version="1.0.0", description=None, category=None, tags=None)
         skillsafe.cmd_save(args)
         # Name should be "my-skill" (from directory)
-        call_args = mock_save.call_args
+        call_args = mock_save_v2.call_args
         self.assertEqual(call_args[0][1], "my-skill")
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_tags_split_by_comma(self, mock_save):
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
+    def test_tags_split_by_comma(self, mock_negotiate, mock_save_v2):
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(path=str(self.skill_dir), version="1.0.0", description=None, category=None, tags="a, b, c")
         skillsafe.cmd_save(args)
-        # The 4th positional arg to client.save() is the metadata dict
-        call_args = mock_save.call_args[0]
-        metadata_arg = call_args[3]
+        # The 3rd positional arg to client.save_v2() is the metadata dict
+        call_args = mock_save_v2.call_args[0]
+        metadata_arg = call_args[2]
         self.assertEqual(metadata_arg["tags"], ["a", "b", "c"])
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_archive_too_large_exits(self, mock_save):
+    def test_archive_too_large_exits(self):
         args = _mock_args(path=str(self.skill_dir), version="1.0.0", description=None, category=None, tags=None)
-        with mock.patch("skillsafe.create_archive", return_value=b"x" * (11 * 1024 * 1024)):
+        with mock.patch("skillsafe.build_file_manifest", return_value=[{"path": "big.bin", "size": 11 * 1024 * 1024, "sha256": "abc"}]):
             with self.assertRaises(SystemExit):
                 skillsafe.cmd_save(args)
 
@@ -1194,7 +1207,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "download")
     @mock.patch("skillsafe._update_lockfile")
     def test_install_with_version(self, mock_lockfile, mock_download, mock_verify):
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "verified", "details": {}}
         install_dir = Path(self.tmpdir) / "custom_skills"
         install_dir.mkdir()
@@ -1212,7 +1225,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch("skillsafe._update_lockfile")
     def test_install_resolves_latest(self, mock_lockfile, mock_meta, mock_download, mock_verify):
         mock_meta.return_value = {"latest_version": "2.0.0"}
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "verified", "details": {}}
         install_dir = Path(self.tmpdir) / "custom2"
         install_dir.mkdir()
@@ -1227,7 +1240,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "download")
     @mock.patch("skillsafe._update_lockfile")
     def test_tree_hash_mismatch_aborts(self, mock_lockfile, mock_download, mock_verify):
-        mock_download.return_value = (self.archive, "sha256:wrong_hash")
+        mock_download.return_value = ("archive", (self.archive, "sha256:wrong_hash"))
         args = _mock_args(
             skill="@alice/my-skill", version="1.0.0",
             skills_dir=str(Path(self.tmpdir) / "out"), tool=None,
@@ -1239,7 +1252,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch("skillsafe._update_lockfile")
     def test_empty_tree_hash_aborts(self, mock_lockfile, mock_download):
         """Audit #9 fix: empty server_tree_hash aborts installation."""
-        mock_download.return_value = (self.archive, "")  # Empty tree hash
+        mock_download.return_value = ("archive", (self.archive, ""))  # Empty tree hash
         install_dir = Path(self.tmpdir) / "out2"
         install_dir.mkdir()
         args = _mock_args(
@@ -1255,7 +1268,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch("skillsafe._update_lockfile")
     def test_verify_error_warns_and_continues(self, mock_lockfile, mock_download, mock_verify):
         """Audit #11 fix: SkillSafeError during verify prints warning to stderr."""
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.side_effect = skillsafe.SkillSafeError("server_error", "Internal error", 500)
         install_dir = Path(self.tmpdir) / "out3"
         install_dir.mkdir()
@@ -1274,7 +1287,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "download")
     @mock.patch("skillsafe._update_lockfile")
     def test_critical_verdict_aborts(self, mock_lockfile, mock_download, mock_verify):
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "critical", "details": {"reason": "tampered"}}
         args = _mock_args(
             skill="@alice/my-skill", version="1.0.0",
@@ -1287,7 +1300,7 @@ class TestCmdInstall(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "download")
     @mock.patch("skillsafe._update_lockfile")
     def test_divergent_non_interactive_rejects(self, mock_lockfile, mock_download, mock_verify):
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "divergent", "details": {}}
         install_dir = Path(self.tmpdir) / "out4"
         install_dir.mkdir()
@@ -1422,54 +1435,71 @@ class TestCmdBackup(unittest.TestCase):
         skillsafe.CONFIG_FILE = self._orig_config_file
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
     @mock.patch.object(skillsafe.SkillSafeClient, "resolve_next_version")
-    def test_backup_auto_version(self, mock_resolve, mock_save):
+    @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
+    def test_backup_auto_version(self, mock_meta, mock_resolve, mock_negotiate, mock_save_v2):
+        mock_meta.side_effect = skillsafe.SkillSafeError("not_found", "Not found", 404)
         mock_resolve.return_value = "0.1.0"
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(path=str(self.skill_dir), name=None, version=None)
         skillsafe.cmd_backup(args)
         mock_resolve.assert_called_once()
-        mock_save.assert_called_once()
+        mock_save_v2.assert_called_once()
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_backup_explicit_version(self, mock_save):
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
+    @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
+    def test_backup_explicit_version(self, mock_meta, mock_negotiate, mock_save_v2):
+        mock_meta.side_effect = skillsafe.SkillSafeError("not_found", "Not found", 404)
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(path=str(self.skill_dir), name=None, version="2.0.0")
         skillsafe.cmd_backup(args)
-        mock_save.assert_called_once()
+        mock_save_v2.assert_called_once()
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
-    def test_backup_custom_name(self, mock_save):
-        mock_save.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
+    @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
+    def test_backup_custom_name(self, mock_meta, mock_negotiate, mock_save_v2):
+        mock_meta.side_effect = skillsafe.SkillSafeError("not_found", "Not found", 404)
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.return_value = {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"}
         args = _mock_args(path=str(self.skill_dir), name="custom-name", version="1.0.0")
         skillsafe.cmd_backup(args)
-        call_args = mock_save.call_args[0]
+        call_args = mock_save_v2.call_args[0]
         self.assertEqual(call_args[1], "custom-name")
 
-    def test_backup_reserved_name_exits_with_error(self):
-        """Audit #8 fix: reserved name prints error and exits with code 1."""
+    def test_backup_reserved_name_returns_early(self):
+        """Reserved name prints message and returns (does not exit)."""
         reserved_dir = Path(self.tmpdir) / "skillsafe"
         reserved_dir.mkdir()
         (reserved_dir / "SKILL.md").write_text("# Skill\n")
         args = _mock_args(path=str(reserved_dir), name=None, version="1.0.0")
-        with mock.patch.object(skillsafe.SkillSafeClient, "save") as mock_save:
-            with self.assertRaises(SystemExit) as ctx:
+        with mock.patch.object(skillsafe.SkillSafeClient, "save_v2") as mock_save_v2:
+            with mock.patch("builtins.print") as mock_print:
                 skillsafe.cmd_backup(args)
-            self.assertEqual(ctx.exception.code, 1)
-            mock_save.assert_not_called()
+            mock_save_v2.assert_not_called()
+            output = " ".join(str(c) for c in mock_print.call_args_list)
+            self.assertIn("reserved", output)
 
-    @mock.patch.object(skillsafe.SkillSafeClient, "save")
+    @mock.patch.object(skillsafe.SkillSafeClient, "save_v2")
+    @mock.patch.object(skillsafe.SkillSafeClient, "negotiate")
     @mock.patch.object(skillsafe.SkillSafeClient, "resolve_next_version")
-    def test_backup_version_conflict_retry(self, mock_resolve, mock_save):
+    @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
+    def test_backup_version_conflict_retry(self, mock_meta, mock_resolve, mock_negotiate, mock_save_v2):
+        mock_meta.side_effect = skillsafe.SkillSafeError("not_found", "Not found", 404)
         mock_resolve.side_effect = ["0.1.0", "0.1.1"]
-        mock_save.side_effect = [
+        mock_negotiate.return_value = {"needed_files": [], "existing_blobs": []}
+        mock_save_v2.side_effect = [
             skillsafe.SkillSafeError("version_conflict", "Version exists", 409),
             {"skill_id": "skl_1", "version_id": "ver_1", "tree_hash": "sha256:abc"},
         ]
         args = _mock_args(path=str(self.skill_dir), name=None, version=None)
         skillsafe.cmd_backup(args)
-        self.assertEqual(mock_save.call_count, 2)
+        self.assertEqual(mock_save_v2.call_count, 2)
 
     def test_backup_not_a_directory_exits(self):
         args = _mock_args(path="/nonexistent", name=None, version="1.0.0")
@@ -1514,7 +1544,7 @@ class TestCmdRestore(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
     def test_restore_basic(self, mock_meta, mock_download, mock_verify):
         mock_meta.return_value = {"latest_version": "1.0.0"}
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "verified", "details": {}}
         output_dir = Path(self.tmpdir) / "output"
         args = _mock_args(name="my-skill", output=str(output_dir), skills_dir=None, tool=None)
@@ -1526,7 +1556,7 @@ class TestCmdRestore(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
     def test_restore_with_namespace(self, mock_meta, mock_download, mock_verify):
         mock_meta.return_value = {"latest_version": "1.0.0"}
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         mock_verify.return_value = {"verdict": "verified", "details": {}}
         output_dir = Path(self.tmpdir) / "output2"
         args = _mock_args(name="@alice/my-skill", output=str(output_dir), skills_dir=None, tool=None)
@@ -1537,7 +1567,7 @@ class TestCmdRestore(unittest.TestCase):
     @mock.patch.object(skillsafe.SkillSafeClient, "get_metadata")
     def test_restore_tree_hash_mismatch_aborts(self, mock_meta, mock_download):
         mock_meta.return_value = {"latest_version": "1.0.0"}
-        mock_download.return_value = (self.archive, "sha256:wrong")
+        mock_download.return_value = ("archive", (self.archive, "sha256:wrong"))
         args = _mock_args(name="my-skill", output=str(Path(self.tmpdir) / "out"), skills_dir=None, tool=None)
         with self.assertRaises(SystemExit):
             skillsafe.cmd_restore(args)
@@ -1547,7 +1577,7 @@ class TestCmdRestore(unittest.TestCase):
     def test_restore_empty_tree_hash_aborts(self, mock_meta, mock_download):
         """Audit #10 fix: empty tree hash aborts restore."""
         mock_meta.return_value = {"latest_version": "1.0.0"}
-        mock_download.return_value = (self.archive, "")
+        mock_download.return_value = ("archive", (self.archive, ""))
         output_dir = Path(self.tmpdir) / "output3"
         args = _mock_args(name="my-skill", output=str(output_dir), skills_dir=None, tool=None)
         with self.assertRaises(SystemExit) as ctx:
@@ -1569,7 +1599,7 @@ class TestCmdRestore(unittest.TestCase):
     def test_restore_with_verification(self, mock_meta, mock_download):
         """Audit #12 fix: dual-side verification is now performed in restore."""
         mock_meta.return_value = {"latest_version": "1.0.0"}
-        mock_download.return_value = (self.archive, self.tree_hash)
+        mock_download.return_value = ("archive", (self.archive, self.tree_hash))
         output_dir = Path(self.tmpdir) / "output_verify"
         args = _mock_args(name="my-skill", output=str(output_dir), skills_dir=None, tool=None)
         with mock.patch.object(skillsafe.SkillSafeClient, "verify") as mock_verify:
