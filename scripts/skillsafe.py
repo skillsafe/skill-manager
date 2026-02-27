@@ -46,7 +46,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Python version guard
@@ -57,16 +57,19 @@ if sys.version_info < (3, 8):
     sys.exit(1)
 
 
-def _safe_extractall(tar: tarfile.TarFile, path: str) -> None:
+def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
     """Extract tarfile safely.  Uses the ``filter="data"`` parameter on
     Python 3.12+ (which blocks absolute paths, traversals, and special
-    members).  On older Pythons we apply equivalent manual checks."""
+    members).  On older Pythons we validate each member then extract
+    individually to avoid TOCTOU races."""
     if sys.version_info >= (3, 12):
         tar.extractall(path=path, filter="data")
     else:
-        # Manual safety: reject absolute paths, traversals, and
-        # special file types (devices, fifos, etc.)
+        # Manual safety: reject absolute paths, traversals, symlinks,
+        # hardlinks, and special file types.  Extract member-by-member
+        # so the validated list cannot be swapped between check and use.
         dest = os.path.realpath(path)
+        safe_members: list = []
         for member in tar.getmembers():
             member_path = os.path.normpath(member.name)
             if member_path.startswith("/") or member_path.startswith("..") or "/../" in member_path:
@@ -74,19 +77,22 @@ def _safe_extractall(tar: tarfile.TarFile, path: str) -> None:
             resolved = os.path.realpath(os.path.join(dest, member_path))
             if not resolved.startswith(dest + os.sep) and resolved != dest:
                 raise tarfile.TarError(f"Path escapes destination: {member.name}")
-            if member.islnk() or member.issym():
-                link_target = os.path.realpath(os.path.join(dest, os.path.dirname(member_path), member.linkname))
-                if not link_target.startswith(dest + os.sep) and link_target != dest:
-                    raise tarfile.TarError(f"Symlink escapes destination: {member.name} -> {member.linkname}")
-            if not (member.isfile() or member.isdir() or member.issym()):
+            # Block symlinks entirely — skills should never contain them
+            if member.issym():
+                raise tarfile.TarError(f"Blocked symlink: {member.name} -> {member.linkname}")
+            # Block hardlinks — they can reference arbitrary files on the host
+            if member.islnk():
+                raise tarfile.TarError(f"Blocked hardlink: {member.name} -> {member.linkname}")
+            if not (member.isfile() or member.isdir()):
                 raise tarfile.TarError(f"Blocked special member: {member.name}")
-        tar.extractall(path=path)
+            safe_members.append(member)
+        tar.extractall(path=path, members=safe_members)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 RULESET_VERSION = "2025.01.01"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
@@ -109,6 +115,49 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# Module-level update check state — set by _request(), read by _print_update_notice()
+_update_available: Optional[str] = None  # latest version if newer than VERSION, else None
+
+
+def _parse_semver(v: str) -> Tuple[int, ...]:
+    """Parse a semver string into a tuple of ints for comparison."""
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)', v)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _check_version_header(headers: Any) -> None:
+    """Read X-SkillSafe-CLI-Latest from response headers and set _update_available."""
+    global _update_available
+    if _update_available is not None:
+        return  # Already detected, don't re-check
+    try:
+        latest = headers.get("X-SkillSafe-CLI-Latest", "")
+        if not isinstance(latest, str) or not latest:
+            return
+        if not re.match(r'^\d+\.\d+\.\d+', latest):
+            return
+        if _parse_semver(latest) > _parse_semver(VERSION):
+            _update_available = latest
+    except Exception:
+        return  # Never let version check break normal operation
+
+
+def _print_update_notice() -> None:
+    """Print an update notice if a newer CLI version was detected."""
+    if _update_available:
+        print(f"\n{yellow(f'Update available: v{VERSION} → v{_update_available}')}")
+        print(f"  Run: {bold('curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o scripts/skillsafe.py')}")
+        print(f"  Or:  {bold('python3 scripts/skillsafe.py self-update')}\n")
+
+
+def _mask_api_key(key: str) -> str:
+    """Return a masked version of an API key showing only prefix and last 4 chars."""
+    if len(key) <= 8:
+        return key[:2] + "****"
+    return key[:4] + "..." + key[-4:]
 
 # Skill names reserved by SkillSafe (managed/updated by skillsafe.ai)
 RESERVED_SKILL_NAMES = {"skillsafe"}
@@ -161,13 +210,28 @@ def load_config() -> Dict[str, Any]:
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """Write config to ~/.skillsafe/config.json, creating dirs as needed."""
+    """Write config to ~/.skillsafe/config.json atomically, creating dirs as needed."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
-    # Restrict permissions so other users cannot read the API key
-    os.chmod(CONFIG_FILE, 0o600)
+    # Restrict directory so other users cannot list contents
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    # Atomic write: write to temp file then rename to avoid corruption on crash
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, str(CONFIG_FILE))
+    except BaseException:
+        # Clean up temp file on any failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def require_config() -> Dict[str, Any]:
@@ -484,18 +548,59 @@ class Scanner:
         except Exception:
             return findings
 
+        in_block_comment = False
         for lineno_0, line in enumerate(lines):
             stripped = line.lstrip()
+
+            # Track multi-line block comment state
+            if in_block_comment:
+                if "*/" in stripped:
+                    in_block_comment = False
+                    # There may be code after the closing */
+                    after_close = stripped.split("*/", 1)[1].strip()
+                    if after_close:
+                        stripped = after_close
+                        # Fall through to scan the remainder
+                    else:
+                        continue
+                else:
+                    continue
             # Skip single-line comments
-            if stripped.startswith("//"):
+            elif stripped.startswith("//"):
                 continue
-            # Skip pure JSDoc/block comment markers
-            if stripped == "*" or stripped == "*/" or stripped.startswith("/*"):
+            # Detect block comment start
+            elif stripped.startswith("/*"):
+                if "*/" not in stripped[2:]:
+                    in_block_comment = True
+                    continue
+                else:
+                    # Inline block comment: /* ... */ code
+                    after_close = stripped.split("*/", 1)[1].strip()
+                    if after_close:
+                        stripped = after_close
+                        # Fall through to scan the remainder
+                    else:
+                        continue
+            # Skip JSDoc/block comment continuation lines
+            elif stripped == "*" or stripped == "*/":
                 continue
             # For JSDoc `* text` lines, strip the leading `* ` and scan the remainder
-            if stripped.startswith("* ") or stripped.startswith("*\t"):
+            elif stripped.startswith("* ") or stripped.startswith("*\t"):
                 stripped = stripped[2:]
                 # Fall through to scan the remainder
+
+            # Strip inline block comments from remaining code: code /* ... */ more_code
+            # Strip inline block comments from code (e.g., `code /* comment */ more`)
+            # Only strip when /* appears before */ to avoid mishandling string
+            # literals that contain these sequences (known limitation of regex scanning)
+            while "/*" in stripped and "*/" in stripped:
+                idx_open = stripped.index("/*")
+                idx_close = stripped.index("*/")
+                if idx_open >= idx_close:
+                    break  # */ before /* — not a real inline comment
+                before = stripped[:idx_open]
+                after = stripped[idx_close + 2:]
+                stripped = (before + " " + after).strip()
 
             for pattern, rule_id, severity, message in self._JS_COMPILED:
                 if pattern.search(stripped):
@@ -531,7 +636,7 @@ class Scanner:
                         "file": rel,
                         "line": lineno_0 + 1,
                         "message": message,
-                        "context": _redact_line(line.strip(), 120),
+                        "context": _redact_line(line.strip()),
                     })
 
         return findings
@@ -563,24 +668,17 @@ class Scanner:
         return findings
 
 
-def _redact_line(line: str, max_len: int, is_secret: bool = True) -> str:
-    """Truncate and redact lines that may contain secrets.
+def _redact_line(line: str) -> str:
+    """Redact a line that contains a detected secret.
 
-    For lines flagged as containing a detected secret, the middle portion
-    is replaced with ``****`` so that the raw secret value is never
-    included in the scan report uploaded to the server.  Non-secret lines
-    are simply truncated.
+    The middle portion is replaced with ``****`` so that the raw secret
+    value is never included in the scan report uploaded to the server.
     """
-    if is_secret:
-        # Always redact: show first 20 chars + **** + last 4 chars
-        if len(line) > 24:
-            return line[:20] + "****" + line[-4:]
-        # Very short line — still mask the middle
-        return line[:4] + "****"
-    # Non-secret lines: just truncate
-    if len(line) > max_len:
-        return line[:max_len] + "..."
-    return line
+    # Always redact: show first 20 chars + **** + last 4 chars
+    if len(line) > 24:
+        return line[:20] + "****" + line[-4:]
+    # Very short line — still mask the middle
+    return line[:4] + "****"
 
 
 # ---------------------------------------------------------------------------
@@ -608,11 +706,12 @@ def compute_tree_hash_v2(files: list[dict]) -> str:
     SHA-256 hashed with "sha256tree:" prefix.
     """
     sorted_files = sorted(files, key=lambda f: f["path"])
-    manifest = ""
+    parts = []
     for f in sorted_files:
         h = f["hash"]
         hex_hash = h[len("sha256:"):] if h.startswith("sha256:") else h
-        manifest += f"{f['path']}\0{hex_hash}\n"
+        parts.append(f"{f['path']}\0{hex_hash}\n")
+    manifest = "".join(parts)
     return "sha256tree:" + hashlib.sha256(manifest.encode("utf-8")).hexdigest()
 
 
@@ -654,8 +753,25 @@ def build_file_manifest(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+_BLOB_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SHARE_ID_RE = re.compile(r"^shr_[a-zA-Z0-9]{4,64}$")
+
+
+def _validate_share_id(share_id: str) -> None:
+    """Raise ValueError if share_id doesn't match expected shr_ format."""
+    if not _SHARE_ID_RE.match(share_id):
+        raise ValueError(f"Invalid share ID format: {share_id!r}")
+
+
+def _validate_blob_hash(blob_hash: str) -> None:
+    """Raise ValueError if blob_hash is not a valid sha256:<hex> string."""
+    if not _BLOB_HASH_RE.match(blob_hash):
+        raise ValueError(f"Invalid blob hash format: {blob_hash!r}")
+
+
 def get_cached_blob(blob_hash: str) -> Optional[bytes]:
     """Check local blob cache. Returns bytes if cached and hash verified, else None."""
+    _validate_blob_hash(blob_hash)
     cache_path = BLOB_CACHE_DIR / blob_hash
     if not cache_path.exists():
         return None
@@ -678,10 +794,21 @@ def get_cached_blob(blob_hash: str) -> Optional[bytes]:
 
 
 def cache_blob(blob_hash: str, data: bytes) -> None:
-    """Write blob to local cache."""
+    """Write blob to local cache atomically."""
+    _validate_blob_hash(blob_hash)
     BLOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = BLOB_CACHE_DIR / blob_hash
-    cache_path.write_bytes(data)
+    fd, tmp_path = tempfile.mkstemp(dir=str(BLOB_CACHE_DIR), prefix=".blob_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, str(cache_path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +884,11 @@ class SkillSafeClient:
                 )
         self.api_key = api_key
 
+    @staticmethod
+    def _encode_path_segment(segment: str) -> str:
+        """Percent-encode a URL path segment (defense-in-depth for library callers)."""
+        return urllib.parse.quote(segment, safe="")
+
     # -- Low-level request --------------------------------------------------
 
     def _request(
@@ -787,9 +919,18 @@ class SkillSafeClient:
 
         req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
 
+        # Max sizes for response bodies to prevent OOM from malicious servers
+        _MAX_JSON_RESPONSE = 10 * 1024 * 1024  # 10 MB for JSON API responses
+        _MAX_RAW_RESPONSE = 50 * 1024 * 1024   # 50 MB for file downloads
+        _MAX_ERROR_BODY = 64 * 1024             # 64 KB for error responses
+
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                data = resp.read()
+                _check_version_header(resp.headers)
+                max_size = _MAX_RAW_RESPONSE if raw_response else _MAX_JSON_RESPONSE
+                data = resp.read(max_size + 1)
+                if len(data) > max_size:
+                    raise SkillSafeError("response_too_large", f"Response exceeds {max_size // (1024*1024)} MB limit", 0)
                 if raw_response:
                     return data, resp.headers
                 try:
@@ -797,7 +938,8 @@ class SkillSafeClient:
                 except json.JSONDecodeError:
                     raise SkillSafeError("invalid_response", f"Server returned invalid JSON: {data[:200]!r}", 0)
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8", errors="replace")
+            _check_version_header(e.headers)
+            error_body = e.read(_MAX_ERROR_BODY).decode("utf-8", errors="replace")
             # Parse Retry-After header for 429 responses (GAP-7.3)
             retry_after: Optional[int] = None
             if e.code == 429:
@@ -846,7 +988,8 @@ class SkillSafeClient:
                 header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"; filename="{safe_filename}"')
             else:
                 header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"')
-            header_lines.append(f"Content-Type: {ct}")
+            safe_ct = ct.replace("\r", "").replace("\n", "")
+            header_lines.append(f"Content-Type: {safe_ct}")
             header_lines.append("")
             header_bytes = "\r\n".join(header_lines).encode("utf-8")
             parts.append(header_bytes + b"\r\n" + data)
@@ -873,7 +1016,9 @@ class SkillSafeClient:
         if scan_report_json:
             fields.insert(1, ("scan_report", "", scan_report_json.encode("utf-8"), "application/json"))
         body, ct = self._build_multipart(fields)
-        resp = self._request("POST", f"/v1/skills/@{namespace}/{name}", body=body, content_type=ct)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("POST", f"/v1/skills/@{ns}/{nm}", body=body, content_type=ct)
         return resp.get("data", resp)
 
     def negotiate(
@@ -884,6 +1029,8 @@ class SkillSafeClient:
         file_manifest: list[dict],
     ) -> dict:
         """POST /v1/skills/@{ns}/{name}/negotiate -- determine which files need uploading."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
         payload = {
             "version": version,
             "file_manifest": file_manifest,
@@ -891,7 +1038,7 @@ class SkillSafeClient:
         body = json.dumps(payload).encode("utf-8")
         resp = self._request(
             "POST",
-            f"/v1/skills/@{namespace}/{name}/negotiate",
+            f"/v1/skills/@{ns}/{nm}/negotiate",
             body=body,
             content_type="application/json",
         )
@@ -923,16 +1070,32 @@ class SkillSafeClient:
         if scan_report_json:
             fields.append(("scan_report", "", scan_report_json.encode("utf-8"), "application/json"))
 
-        # Add file fields for needed files only
+        # Add file fields for needed files only — validate against local manifest
+        # to prevent a compromised server from exfiltrating arbitrary files
+        manifest_paths = {f["path"] for f in file_manifest}
         skill_path = Path(skill_path).resolve()
         for i, rel_path in enumerate(needed_files):
+            if rel_path not in manifest_paths:
+                raise SkillSafeError(
+                    "invalid_needed_file",
+                    f"Server requested file not in local manifest: {rel_path!r}",
+                )
             file_path = skill_path / rel_path
+            # Guard: resolved path must stay inside skill_path
+            resolved = file_path.resolve()
+            if not str(resolved).startswith(str(skill_path) + os.sep) and resolved != skill_path:
+                raise SkillSafeError(
+                    "path_traversal",
+                    f"Requested file escapes skill directory: {rel_path!r}",
+                )
             content = file_path.read_bytes()
             # The filename carries the relative path (server reads it from value.name)
             fields.append((f"file_{i}", rel_path, content, "application/octet-stream"))
 
         body, ct = self._build_multipart(fields)
-        resp = self._request("POST", f"/v1/skills/@{namespace}/{name}", body=body, content_type=ct)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("POST", f"/v1/skills/@{ns}/{nm}", body=body, content_type=ct)
         return resp.get("data", resp)
 
     def share(
@@ -944,13 +1107,16 @@ class SkillSafeClient:
         expires_in: Optional[str] = None,
     ) -> Dict[str, Any]:
         """POST /v1/skills/@{ns}/{name}/versions/{ver}/share — create a share link."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
         payload: Dict[str, Any] = {"visibility": visibility}
         if expires_in:
             payload["expires_in"] = expires_in
         body = json.dumps(payload).encode("utf-8")
         resp = self._request(
             "POST",
-            f"/v1/skills/@{namespace}/{name}/versions/{version}/share",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/share",
             body=body,
             content_type="application/json",
         )
@@ -963,7 +1129,12 @@ class SkillSafeClient:
         Returns (format, data) tuple:
           - v2 (JSON manifest): ("files", manifest_dict)
           - v1 (archive):       ("archive", (archive_bytes, tree_hash, version))
+
+        Note: Tree hash / manifest integrity data is bundled in the same response
+        as the payload. This guards against corruption but not against a MITM that
+        can modify both in lockstep.
         """
+        _validate_share_id(share_id)
         data, headers = self._request(
             "GET", f"/v1/share/{share_id}/download", raw_response=True, auth=False
         )
@@ -982,9 +1153,16 @@ class SkillSafeClient:
         Returns (format, data) tuple:
           - v2 (JSON manifest): ("files", manifest_dict)
           - v1 (archive):       ("archive", (archive_bytes, tree_hash))
+
+        Note: For v1 archives, the tree hash is delivered in the same HTTP response
+        as the data (X-SkillSafe-Tree-Hash header). This protects against accidental
+        corruption but not against a MITM that can modify both in lockstep.
         """
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
         data, headers = self._request(
-            "GET", f"/v1/skills/@{namespace}/{name}/download/{version}", raw_response=True
+            "GET", f"/v1/skills/@{ns}/{nm}/download/{ver}", raw_response=True
         )
         ct = headers.get("Content-Type", "")
         if "application/json" in ct:
@@ -997,10 +1175,13 @@ class SkillSafeClient:
         self, namespace: str, name: str, version: str, scan_report: Dict[str, Any]
     ) -> Dict[str, Any]:
         """POST /v1/skills/@{ns}/{name}/versions/{version}/verify — submit verification."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
         body = json.dumps({"scan_report": scan_report}).encode("utf-8")
         resp = self._request(
             "POST",
-            f"/v1/skills/@{namespace}/{name}/versions/{version}/verify",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/verify",
             body=body,
             content_type="application/json",
         )
@@ -1025,7 +1206,9 @@ class SkillSafeClient:
 
     def get_metadata(self, namespace: str, name: str, auth: bool = False) -> Dict[str, Any]:
         """GET /v1/skills/@{ns}/{name} — skill metadata."""
-        resp = self._request("GET", f"/v1/skills/@{namespace}/{name}", auth=auth)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}", auth=auth)
         return resp.get("data", resp)
 
     def resolve_next_version(self, namespace: str, name: str) -> str:
@@ -1046,11 +1229,14 @@ class SkillSafeClient:
 
     def get_versions(self, namespace: str, name: str, limit: int = 20) -> Dict[str, Any]:
         """GET /v1/skills/@{ns}/{name}/versions — version list."""
-        resp = self._request("GET", f"/v1/skills/@{namespace}/{name}/versions?limit={limit}", auth=False)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}/versions?limit={limit}", auth=False)
         return resp
 
     def download_blob(self, blob_hash: str) -> bytes:
         """GET /v1/blobs/{hash} — download an individual blob by content-hash."""
+        _validate_blob_hash(blob_hash)
         data, headers = self._request(
             "GET", f"/v1/blobs/{blob_hash}", raw_response=True, auth=False
         )
@@ -1097,21 +1283,30 @@ def install_from_manifest(
     manifest: dict,
     dest_dir: Path,
     verbose: bool = False,
+    install_timeout: float = 600,  # 10 minutes cumulative timeout
 ) -> Tuple[str, int, int]:
     """Download files from a v2 manifest and reconstruct the skill directory.
 
     Returns (tree_hash, cached_count, downloaded_count).
     """
+    install_start = time.monotonic()
+
+    # Validate manifest structure
+    if not isinstance(manifest, dict) or "files" not in manifest or "tree_hash" not in manifest:
+        raise SkillSafeError("invalid_manifest", "Server returned incomplete manifest (missing 'files' or 'tree_hash')")
     files = manifest["files"]
     tree_hash = manifest["tree_hash"]
     cached_count = 0
     downloaded_count = 0
     max_retries = 3
 
-    # Step 0: Validate all paths before downloading anything (GAP-4.4)
+    # Step 0: Validate all paths and blob hashes before downloading anything (GAP-4.4)
     dest_dir_resolved = Path(os.path.realpath(dest_dir))
     for f in files:
+        if not isinstance(f, dict) or "path" not in f or "hash" not in f or "size" not in f:
+            raise SkillSafeError("invalid_manifest", "Manifest file entry missing required fields (path, hash, size)")
         _validate_manifest_path(f["path"], dest_dir_resolved)
+        _validate_blob_hash(f["hash"])
 
     # Step 1: Download or fetch from cache each blob
     downloaded_files: List[Dict[str, Any]] = []
@@ -1133,7 +1328,8 @@ def install_from_manifest(
                 print(f"    Downloading: {blob_path} ({blob_size} bytes)")
             last_err: Optional[Exception] = None
             max_blob_retries = max_retries
-            for attempt in range(max_blob_retries):
+            attempt = 0
+            while attempt < max_blob_retries:
                 try:
                     data = client.download_blob(blob_hash)
                     last_err = None
@@ -1151,11 +1347,24 @@ def install_from_manifest(
                         if verbose:
                             print(f"    Retry {attempt + 1}/{max_blob_retries - 1} after {wait}s"
                                   f"{' (rate limited)' if e.status == 429 else ''}...")
+                        # Guard: cumulative timeout prevents server-driven DoS via repeated 429s
+                        if time.monotonic() - install_start > install_timeout:
+                            raise SkillSafeError(
+                                "install_timeout",
+                                f"Install timed out after {install_timeout:.0f}s due to repeated retries"
+                            )
                         time.sleep(wait)
+                attempt += 1
             if last_err is not None:
                 raise last_err
 
-            # Per-blob SHA-256 verification
+            # Per-blob size and SHA-256 verification
+            if len(data) != blob_size:
+                raise SkillSafeError(
+                    "integrity_error",
+                    f"Blob size mismatch for '{blob_path}': "
+                    f"expected {blob_size} bytes, got {len(data)} bytes"
+                )
             actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
             if actual_hash != blob_hash:
                 raise SkillSafeError(
@@ -1197,6 +1406,10 @@ def install_from_manifest(
 
     # Step 4: Write files to dest_dir
     dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest_dir, 0o700)
+    except OSError:
+        pass  # Best-effort: may fail on some filesystems
     for f in downloaded_files:
         file_path = dest_dir / f["path"]
 
@@ -1298,7 +1511,7 @@ def _validate_saved_key(api_base: str) -> bool:
     print(f"  Account:   {cfg['account_id']}")
     print(f"  Username:  {cfg['username']}")
     print(f"  Namespace: {cfg['namespace']}")
-    print(f"  API key:   {dim(api_key[:10] + '...')}")
+    print(f"  API key:   {dim(_mask_api_key(api_key))}")
     print(f"  Config:    {CONFIG_FILE}")
     print(f"\n  To re-authenticate, delete {CONFIG_FILE} and run auth again.")
     return True
@@ -1318,7 +1531,7 @@ def cmd_whoami(args: argparse.Namespace) -> None:
     print(f"\n  {bold('Local config')}")
     print(f"  Username:    {cfg.get('username', dim('unknown'))}")
     print(f"  Namespace:   {cfg.get('namespace', dim('unknown'))}")
-    print(f"  API key:     {dim(api_key[:10] + '...')}")
+    print(f"  API key:     {dim(_mask_api_key(api_key))}")
     print(f"  API base:    {cfg.get('api_base', DEFAULT_API_BASE)}")
     print(f"  Config file: {CONFIG_FILE}")
 
@@ -1416,6 +1629,10 @@ def _auth_browser(api_base: str) -> None:
         data = result.get("data", result)
         session_id: str = data["session_id"]
         login_url: str = data["login_url"]
+        # Validate session_id format to prevent URL path injection
+        if not re.match(r'^[a-zA-Z0-9_-]{1,128}$', session_id):
+            print("Error: Server returned invalid session ID format.", file=sys.stderr)
+            sys.exit(1)
     except SkillSafeError as e:
         print(f"Error: {e.message}", file=sys.stderr)
         sys.exit(1)
@@ -1423,7 +1640,18 @@ def _auth_browser(api_base: str) -> None:
         print("Error: Unexpected response from server.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 2: Open browser
+    # Step 2: Open browser — validate URL scheme and host first
+    parsed_url = urllib.parse.urlparse(login_url)
+    if parsed_url.scheme not in ("https", "http"):
+        print(f"Error: Server returned unsafe login URL scheme: {parsed_url.scheme!r}", file=sys.stderr)
+        sys.exit(1)
+    # Only allow login URLs on the same host as the API or known SkillSafe domains
+    api_host = urllib.parse.urlparse(api_base).hostname or ""
+    allowed_hosts = {api_host, "skillsafe.ai", "www.skillsafe.ai", "localhost", "127.0.0.1"}
+    if parsed_url.hostname not in allowed_hosts:
+        print(f"Error: Server returned login URL for unexpected host: {parsed_url.hostname!r}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"  Opening browser to sign in...")
     print(f"  If the browser doesn't open, visit this URL:\n")
     print(f"    {bold(login_url)}\n")
@@ -1441,7 +1669,12 @@ def _auth_browser(api_base: str) -> None:
     elapsed = 0
 
     while elapsed < max_wait:
-        time.sleep(poll_interval)
+        try:
+            time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            print()
+            print("\n  Authentication cancelled.", file=sys.stderr)
+            sys.exit(1)
         elapsed += poll_interval
 
         try:
@@ -1500,7 +1733,7 @@ def _save_auth_result(data: Dict[str, Any], api_base: str) -> None:
     print(f"  Account:   {cfg['account_id']}")
     print(f"  Username:  {cfg['username']}")
     print(f"  Namespace: {cfg['namespace']}")
-    print(f"  API key:   {dim(cfg['api_key'][:10] + '...')}")
+    print(f"  API key:   {dim(_mask_api_key(cfg['api_key']))}")
     print(f"  Config:    {CONFIG_FILE}")
 
 
@@ -1650,6 +1883,10 @@ def cmd_save(args: argparse.Namespace) -> None:
                 print(f"\n  Error: {e}", file=sys.stderr)
                 sys.exit(1)
 
+    if result is None:
+        print("Error: Upload failed after all retries.", file=sys.stderr)
+        sys.exit(1)
+
     # Post-upload tree hash verification
     server_tree_hash = result.get("tree_hash")
     local_tree_hash = compute_tree_hash_v2(file_manifest)
@@ -1742,6 +1979,10 @@ def cmd_install(args: argparse.Namespace) -> None:
             print(f"  Error: {e.message}", file=sys.stderr)
             sys.exit(1)
 
+        # Regex for validating namespace/name/version from untrusted server responses
+        _safe_ident_re = r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$'
+        _safe_version_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+
         if dl_format == "files":
             # v2 manifest — extract metadata
             namespace = dl_data.get("namespace", "shared").lstrip("@")
@@ -1774,6 +2015,18 @@ def cmd_install(args: argparse.Namespace) -> None:
                             break
             except Exception:
                 pass  # Use defaults if we can't parse SKILL.md
+
+        # Sanitize namespace/name/version from untrusted server response
+        # to prevent path traversal in install directories
+        if not re.match(_safe_ident_re, namespace):
+            print(f"Error: Invalid namespace '{namespace}' in share link response.", file=sys.stderr)
+            sys.exit(1)
+        if not re.match(_safe_ident_re, name):
+            print(f"Error: Invalid name '{name}' in share link response.", file=sys.stderr)
+            sys.exit(1)
+        if version != "unknown" and not re.match(_safe_version_re, version):
+            print(f"Error: Invalid version '{version}' in share link response.", file=sys.stderr)
+            sys.exit(1)
 
     else:
         namespace, name = parse_skill_ref(skill_ref)
@@ -1959,33 +2212,50 @@ def _install_to_target(
     """Copy files from source_dir to the final install location."""
     skills_dir = _resolve_skills_dir(args)
 
+    def _safe_copytree(src: Path, dst: Path) -> None:
+        """Copy tree from src to dst, skipping any symlinks for safety."""
+        source_names = {item.name for item in src.iterdir() if not item.is_symlink()}
+        # Remove stale files not present in source (from previous version)
+        if dst.exists():
+            for existing in list(dst.iterdir()):
+                if existing.name not in source_names:
+                    if existing.is_dir():
+                        shutil.rmtree(existing)
+                    else:
+                        existing.unlink()
+        for item in src.iterdir():
+            if ".." in item.name or os.sep in item.name:
+                continue  # Defense-in-depth: skip suspicious names
+            target = dst / item.name
+            if item.is_symlink():
+                continue  # Skip symlinks — never install them
+            if item.is_dir():
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(item, target, symlinks=False)
+            else:
+                shutil.copy2(item, target)
+
     if skills_dir:
         install_dir = skills_dir / name
         install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
         print(f"\n  Installing to {install_dir}...")
-        # Copy all files from source_dir to install_dir
-        for item in source_dir.iterdir():
-            dest = install_dir / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
+        _safe_copytree(source_dir, install_dir)
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
     else:
         install_dir = SKILLS_DIR / f"@{namespace}" / name / version
         install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
         print(f"\n  Installing to {install_dir}...")
-        for item in source_dir.iterdir():
-            dest = install_dir / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
+        _safe_copytree(source_dir, install_dir)
 
         # Update 'current' symlink
         current_link = install_dir.parent / "current"
@@ -2014,7 +2284,14 @@ def _install_to_target_archive(
 
     if skills_dir:
         install_dir = skills_dir / name
+        # Clean stale files from previous version before extracting
+        if install_dir.exists():
+            shutil.rmtree(install_dir)
         install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
         print(f"\n  Installing to {install_dir}...")
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
             _safe_extractall(tar, install_dir)
@@ -2022,7 +2299,14 @@ def _install_to_target_archive(
         print(f"  Location: {install_dir}")
     else:
         install_dir = SKILLS_DIR / f"@{namespace}" / name / version
+        # Clean stale files from previous version before extracting
+        if install_dir.exists():
+            shutil.rmtree(install_dir)
         install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
         print(f"\n  Installing to {install_dir}...")
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
             _safe_extractall(tar, install_dir)
@@ -2203,7 +2487,14 @@ def cmd_list(args: argparse.Namespace) -> None:
                     version = current.name
                 else:
                     versions = [d.name for d in skill_dir.iterdir() if d.is_dir() and d.name != "current"]
-                    version = sorted(versions)[-1] if versions else "?"
+                    def _semver_key(v: str) -> tuple:
+                        """Parse version string into a tuple for proper numeric sorting."""
+                        parts = v.split("-", 1)[0].split(".")
+                        try:
+                            return tuple(int(p) for p in parts)
+                        except ValueError:
+                            return (0,)
+                    version = sorted(versions, key=_semver_key)[-1] if versions else "?"
                 registry_skills.append((f"{ns}/{skill_dir.name}", version, str(skill_dir)))
 
         if registry_skills:
@@ -2288,7 +2579,8 @@ def cmd_backup(args: argparse.Namespace) -> None:
         latest_ver = meta.get("latest_version")
         if latest_ver:
             versions_resp = client.get_versions(namespace, name, limit=1)
-            versions = versions_resp.get("data", versions_resp).get("versions", [])
+            versions_data = versions_resp.get("data", [])
+            versions = versions_data if isinstance(versions_data, list) else []
             if versions and versions[0].get("tree_hash") == tree_hash:
                 print(green(f"\n  No changes detected — latest version v{latest_ver} already has the same content."))
                 print(f"  Skipping backup.")
@@ -2372,6 +2664,10 @@ def cmd_backup(args: argparse.Namespace) -> None:
                 print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
                 sys.exit(1)
 
+    if result is None:
+        print("Error: Upload failed after all retries.", file=sys.stderr)
+        sys.exit(1)
+
     # Post-upload tree hash verification
     server_tree_hash = result.get("tree_hash")
     local_tree_hash = compute_tree_hash_v2(file_manifest)
@@ -2409,9 +2705,13 @@ def cmd_restore(args: argparse.Namespace) -> None:
     else:
         skill_name = ref
 
-    # Sanitize name to prevent path traversal
-    if ".." in skill_name or "/" in skill_name or "\\" in skill_name or skill_name in (".", ""):
-        print("Error: Invalid name (must not contain path separators or '..')", file=sys.stderr)
+    # Sanitize namespace and name to prevent path traversal
+    _restore_ident_re = r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$'
+    if not re.match(_restore_ident_re, namespace):
+        print(f"Error: Invalid namespace '{namespace}'", file=sys.stderr)
+        sys.exit(1)
+    if not re.match(_restore_ident_re, skill_name):
+        print(f"Error: Invalid skill name '{skill_name}'", file=sys.stderr)
         sys.exit(1)
 
     # Determine target directory
@@ -2493,15 +2793,17 @@ def cmd_restore(args: argparse.Namespace) -> None:
                 else:
                     print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
 
-            # Copy to final target directory
+            # Copy to final target directory (skip symlinks for safety)
             target_dir.mkdir(parents=True, exist_ok=True)
             print(f"  Copying to {target_dir}...")
             for item in tmppath.iterdir():
                 dest = target_dir / item.name
+                if item.is_symlink():
+                    continue  # Skip symlinks — never restore them
                 if item.is_dir():
                     if dest.exists():
                         shutil.rmtree(dest)
-                    shutil.copytree(item, dest)
+                    shutil.copytree(item, dest, symlinks=False)
                 else:
                     shutil.copy2(item, dest)
 
@@ -2619,34 +2921,68 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
 
 
 def _update_lockfile(namespace: str, name: str, version: str, tree_hash: str) -> None:
-    """Update skillsafe.lock in the current working directory (if it exists or cwd is a project)."""
+    """Update skillsafe.lock in the current working directory (if it exists or cwd is a project).
+
+    Uses advisory file locking (fcntl on Unix) to prevent concurrent installs
+    from losing each other's entries.
+    """
     lockfile = Path.cwd() / "skillsafe.lock"
 
-    lock_data: Dict[str, Any]
-    if lockfile.exists():
-        with open(lockfile, "r") as f:
+    # Advisory file lock to prevent lost-update race with concurrent installs
+    lock_sentinel = lockfile.with_suffix(".lck")
+    lock_fd = None
+    try:
+        import fcntl
+        lock_sentinel.touch(exist_ok=True)
+        lock_fd = open(lock_sentinel, "r")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass  # fcntl unavailable on Windows; proceed without locking
+
+    try:
+        lock_data: Dict[str, Any]
+        if lockfile.exists():
+            with open(lockfile, "r") as f:
+                try:
+                    lock_data = json.load(f)
+                except json.JSONDecodeError:
+                    print("Warning: Lockfile corrupted, starting fresh", file=sys.stderr)
+                    lock_data = {"lockfile_version": 1, "skills": {}}
+        else:
+            # Only create lockfile if there's a recognizable project marker
+            project_markers = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", ".git"]
+            if not any((Path.cwd() / m).exists() for m in project_markers):
+                return
+            lock_data = {"lockfile_version": 1, "skills": {}}
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lock_data.setdefault("skills", {})[f"@{namespace}/{name}"] = {
+            "version": version,
+            "tree_hash": tree_hash,
+            "installed_at": now,
+        }
+
+        # Atomic write via temp file + os.replace to avoid corruption on crash
+        fd, tmp_path = tempfile.mkstemp(dir=str(lockfile.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(lock_data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, str(lockfile))
+        except BaseException:
             try:
-                lock_data = json.load(f)
-            except json.JSONDecodeError:
-                print("Warning: Lockfile corrupted, starting fresh", file=sys.stderr)
-                lock_data = {"lockfile_version": 1, "skills": {}}
-    else:
-        # Only create lockfile if there's a recognizable project marker
-        project_markers = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", ".git"]
-        if not any((Path.cwd() / m).exists() for m in project_markers):
-            return
-        lock_data = {"lockfile_version": 1, "skills": {}}
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lock_data.setdefault("skills", {})[f"@{namespace}/{name}"] = {
-        "version": version,
-        "tree_hash": tree_hash,
-        "installed_at": now,
-    }
-
-    with open(lockfile, "w") as f:
-        json.dump(lock_data, f, indent=2)
-        f.write("\n")
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    finally:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            lock_fd.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2748,11 +3084,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     args = parser.parse_args(argv)
 
-    # Merge --api-base from top-level into subcommand namespace
-    if args.api_base:
-        setattr(args, "api_base", args.api_base)
-    elif not hasattr(args, "api_base"):
-        setattr(args, "api_base", DEFAULT_API_BASE)
+    # Ensure api_base is set in the namespace (subcommand may not define it)
+    if not getattr(args, "api_base", None):
+        args.api_base = DEFAULT_API_BASE
 
     # Validate --api-base scheme early (allow http only for localhost/127.0.0.1)
     api_base_val = getattr(args, "api_base", DEFAULT_API_BASE) or DEFAULT_API_BASE
@@ -2787,6 +3121,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     else:
         parser.print_help()
         sys.exit(1)
+
+    # After any command that contacted the server, show update notice if available
+    _print_update_notice()
 
 
 if __name__ == "__main__":

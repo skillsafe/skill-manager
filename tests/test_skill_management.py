@@ -675,11 +675,17 @@ class TestScannerJSRegex(TestScannerBase):
         report = self._scan()
         self.assertTrue(report["clean"])
 
-    def test_jsdoc_star_line_scanned(self):
-        """Audit #13 fix: code after `* ` in JSDoc lines IS now detected."""
+    def test_jsdoc_block_comment_not_flagged(self):
+        """eval() inside a block comment should NOT be flagged (false positive fix)."""
         self._write("test.js", "/**\n * eval(something)\n */\n")
         report = self._scan()
-        # The `* eval(...)` line is now scanned after stripping the leading `* `
+        # Block comments are now fully tracked — content inside is not scanned
+        self.assertNotIn("js_eval", self._rule_ids(report))
+
+    def test_eval_outside_block_comment_flagged(self):
+        """eval() outside a block comment should still be detected."""
+        self._write("test.js", "/* comment */\neval(something)\n")
+        report = self._scan()
         self.assertIn("js_eval", self._rule_ids(report))
 
     def test_clean_js(self):
@@ -1007,23 +1013,13 @@ class TestRedactLine(unittest.TestCase):
 
     def test_long_secret_redacted(self):
         line = "api_key = 'abcdefghijklmnopqrstuvwxyz1234567890'"
-        result = skillsafe._redact_line(line, 120)
+        result = skillsafe._redact_line(line)
         self.assertIn("****", result)
         self.assertTrue(result.startswith(line[:20]))
 
     def test_short_secret_redacted(self):
-        result = skillsafe._redact_line("short", 120)
+        result = skillsafe._redact_line("short")
         self.assertIn("****", result)
-
-    def test_non_secret_truncated(self):
-        long_line = "x" * 200
-        result = skillsafe._redact_line(long_line, 50, is_secret=False)
-        self.assertEqual(len(result), 53)  # 50 + "..."
-        self.assertTrue(result.endswith("..."))
-
-    def test_non_secret_short_unchanged(self):
-        result = skillsafe._redact_line("hello", 120, is_secret=False)
-        self.assertEqual(result, "hello")
 
 
 # ===========================================================================

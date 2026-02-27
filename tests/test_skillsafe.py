@@ -920,7 +920,7 @@ class TestSkillSafeClient(unittest.TestCase):
             self.assertIsNone(req.get_header("Authorization"))
 
     def test_user_agent_header(self):
-        """User-Agent header should be set to skillsafe-cli/0.1.0."""
+        """User-Agent header should include the current CLI version."""
         client = skillsafe.SkillSafeClient()
 
         mock_response = mock.MagicMock()
@@ -931,7 +931,7 @@ class TestSkillSafeClient(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=mock_response) as mock_urlopen:
             client._request("GET", "/v1/test", auth=False)
             req = mock_urlopen.call_args[0][0]
-            self.assertEqual(req.get_header("User-agent"), "skillsafe-cli/0.1.0")
+            self.assertEqual(req.get_header("User-agent"), f"skillsafe-cli/{skillsafe.VERSION}")
 
     def test_request_json_parsing(self):
         """_request should parse JSON response and return dict."""
@@ -1560,37 +1560,37 @@ class TestUtilities(unittest.TestCase):
 
     def test_redact_line_short(self):
         """Short secret lines (<=24 chars) should be redacted: first 4 chars + ****."""
-        result = skillsafe._redact_line("short", 120)
+        result = skillsafe._redact_line("short")
         self.assertEqual(result, "shor****")
 
     def test_redact_line_long(self):
         """Long secret lines (>24 chars) should be redacted: first 20 + **** + last 4."""
         long_line = "x" * 200
-        result = skillsafe._redact_line(long_line, 120)
+        result = skillsafe._redact_line(long_line)
         self.assertEqual(result, "x" * 20 + "****" + "x" * 4)
         self.assertEqual(len(result), 28)
 
-    def test_redact_line_exact_length(self):
-        """Secret lines exactly at max_len should still be redacted."""
-        line = "x" * 120
-        result = skillsafe._redact_line(line, 120)
+    def test_redact_line_exact_boundary(self):
+        """Secret lines at 25 chars should be redacted with first 20 + **** + last 4."""
+        line = "x" * 25
+        result = skillsafe._redact_line(line)
         self.assertEqual(result, "x" * 20 + "****" + "x" * 4)
         self.assertEqual(len(result), 28)
 
     def test_redact_empty_string(self):
         """Empty secret string should return '****' (redaction mask)."""
-        result = skillsafe._redact_line("", 120)
+        result = skillsafe._redact_line("")
         self.assertEqual(result, "****")
 
-    def test_redact_max_len_zero(self):
-        """Secret line with max_len 0 should still be redacted (not truncated)."""
-        result = skillsafe._redact_line("some text", 0)
-        self.assertEqual(result, "some****")
+    def test_redact_24_char_boundary(self):
+        """Secret line at exactly 24 chars should use short redaction (first 4 + ****)."""
+        result = skillsafe._redact_line("x" * 24)
+        self.assertEqual(result, "xxxx****")
 
-    def test_redact_one_char_over(self):
-        """Secret line one char over max_len should be redacted, not truncated."""
+    def test_redact_long_line(self):
+        """Long secret line should be redacted: first 20 + **** + last 4."""
         line = "x" * 121
-        result = skillsafe._redact_line(line, 120)
+        result = skillsafe._redact_line(line)
         self.assertEqual(result, "x" * 20 + "****" + "x" * 4)
         self.assertEqual(len(result), 28)
 
