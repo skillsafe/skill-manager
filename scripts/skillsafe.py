@@ -1786,7 +1786,7 @@ def cmd_save(args: argparse.Namespace) -> None:
     """Save a skill to the registry (private by default)."""
     cfg = require_config()
     path = Path(args.path).resolve()
-    version: str = args.version
+    version: Optional[str] = getattr(args, "version", None)
     description: Optional[str] = getattr(args, "description", None)
     category: Optional[str] = getattr(args, "category", None)
     tags_raw: Optional[str] = getattr(args, "tags", None)
@@ -1795,20 +1795,41 @@ def cmd_save(args: argparse.Namespace) -> None:
         print(f"Error: {path} is not a directory.", file=sys.stderr)
         sys.exit(1)
 
-    # Validate semver format before doing any expensive work
-    semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
-    if not re.match(semver_re, version):
-        print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0, 2.1.0-beta.1).", file=sys.stderr)
-        sys.exit(1)
+    # Validate semver format if version is explicitly provided
+    if version:
+        semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+        if not re.match(semver_re, version):
+            print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0, 2.1.0-beta.1).", file=sys.stderr)
+            sys.exit(1)
 
     name = path.name
     namespace = cfg["username"]
+
+    # Read defaults from .skillsafe.json if present
+    local_meta_path = path / ".skillsafe.json"
+    if local_meta_path.exists():
+        try:
+            with open(local_meta_path) as f:
+                local_meta = json.load(f)
+            if local_meta.get("name"):
+                name = local_meta["name"]
+            if local_meta.get("namespace"):
+                namespace = local_meta["namespace"].lstrip("@")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     _validate_skill_name(name)
 
     if name in RESERVED_SKILL_NAMES:
         print(f"  '{name}' is reserved and has no need to save.")
         return
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    # Auto-resolve version if not provided
+    if not version:
+        print(f"Resolving next version of {bold(f'@{namespace}/{name}')}...")
+        version = client.resolve_next_version(namespace, name)
 
     print(f"Saving {bold(f'@{namespace}/{name}')} v{version}...\n")
 
@@ -1826,6 +1847,20 @@ def cmd_save(args: argparse.Namespace) -> None:
     tree_hash = compute_tree_hash_v2(file_manifest)
     print(f"  Tree hash:    {dim(tree_hash[:30])}...")
 
+    # Step 2b: Check if latest version already has the same tree hash (no changes)
+    try:
+        meta = client.get_metadata(namespace, name, auth=True)
+        latest_ver = meta.get("latest_version")
+        if latest_ver:
+            versions_resp = client.get_versions(namespace, name, limit=1)
+            versions_data = versions_resp.get("data", [])
+            versions_list = versions_data if isinstance(versions_data, list) else []
+            if versions_list and versions_list[0].get("tree_hash") == tree_hash:
+                print(green(f"\n  No changes detected — latest version v{latest_ver} already has the same content."))
+                return
+    except SkillSafeError:
+        pass  # Skill doesn't exist yet, proceed
+
     # Step 3: Scan (optional but recommended)
     print("  Scanning for security issues...")
     scanner = Scanner()
@@ -1833,8 +1868,6 @@ def cmd_save(args: argparse.Namespace) -> None:
     _print_scan_results(report, indent=2)
 
     # Step 4: Negotiate delta upload
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
-
     print("\n  Negotiating upload...")
     try:
         negotiate_result = client.negotiate(namespace, name, version, file_manifest)
@@ -1849,7 +1882,7 @@ def cmd_save(args: argparse.Namespace) -> None:
     if existing_blobs:
         print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
 
-    # Step 5: Save to registry via v2
+    # Step 5: Save to registry via v2 (with retry + version conflict re-resolution)
     print("  Uploading to registry...")
     changelog: Optional[str] = getattr(args, "changelog", None)
 
@@ -1865,6 +1898,7 @@ def cmd_save(args: argparse.Namespace) -> None:
 
     max_retries = 3
     result = None
+    version_re_resolved = False
     for attempt in range(max_retries):
         try:
             result = client.save_v2(
@@ -1873,10 +1907,20 @@ def cmd_save(args: argparse.Namespace) -> None:
             )
             break  # Success
         except SkillSafeError as e:
-            # 409 Conflict: version already exists (previous attempt succeeded but response was lost)
-            if e.status == 409 or e.code == "conflict":
-                print(yellow(f"\n  Version {version} already exists (likely saved on previous attempt)."))
-                sys.exit(0)
+            # Handle version collision: re-resolve version and retry once
+            if (e.status == 409 or e.status == 422) and not version_re_resolved:
+                version_re_resolved = True
+                print(f"  Version {version} conflict, re-resolving...")
+                version = client.resolve_next_version(namespace, name)
+                metadata["version"] = version
+                # Re-negotiate with new version
+                try:
+                    negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+                    needed_files = negotiate_result.get("needed_files", [])
+                except SkillSafeError as e_neg:
+                    print(f"\n  Error: {e_neg.message}", file=sys.stderr)
+                    sys.exit(1)
+                continue
             # 429 Rate Limit: respect Retry-After
             if e.status == 429 and e.retry_after and attempt < max_retries - 1:
                 print(yellow(f"\n  Rate limited, retrying in {e.retry_after}s..."))
@@ -1900,7 +1944,7 @@ def cmd_save(args: argparse.Namespace) -> None:
                 print(yellow(f"\n  Upload failed ({type(e).__name__}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
                 time.sleep(delay)
             else:
-                print(f"\n  Error: {e}", file=sys.stderr)
+                print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
                 sys.exit(1)
 
     if result is None:
@@ -1926,6 +1970,29 @@ def cmd_save(args: argparse.Namespace) -> None:
         print(f"  Tree hash:  {server_tree_hash} (verified)")
     if result.get("new_bytes") is not None:
         print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
+
+    # Update .skillsafe.json after successful save
+    try:
+        meta_data = {}
+        if local_meta_path.exists():
+            try:
+                with open(local_meta_path) as f:
+                    meta_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        meta_data.update({
+            "namespace": f"@{namespace}",
+            "name": name,
+            "version": version,
+            "tree_hash": server_tree_hash or tree_hash,
+            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        with open(local_meta_path, "w") as f:
+            json.dump(meta_data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
     print(f"\n  To share this skill, run:")
     print(f"    skillsafe share @{namespace}/{name} --version {version}")
 
@@ -2221,6 +2288,74 @@ def _handle_verdict(verdict: str, details: Dict[str, Any]) -> bool:
     return True
 
 
+def _write_install_metadata(
+    install_dir: Path,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+) -> None:
+    """Write .skillsafe.json and inject self-improvement frontmatter fields after install."""
+    # Write .skillsafe.json
+    try:
+        meta_path = install_dir / ".skillsafe.json"
+        meta_data = {
+            "namespace": f"@{namespace}",
+            "name": name,
+            "version": version,
+            "tree_hash": tree_hash,
+            "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+    # Inject self-improvement frontmatter fields into SKILL.md
+    skill_md = install_dir / "SKILL.md"
+    if not skill_md.exists():
+        return
+    try:
+        text = skill_md.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(True)  # keep line endings
+
+        # Find frontmatter boundaries (---\n ... ---\n)
+        if not lines or not lines[0].rstrip() == "---":
+            return  # No frontmatter
+
+        end_idx = None
+        for i in range(1, len(lines)):
+            if lines[i].rstrip() == "---":
+                end_idx = i
+                break
+        if end_idx is None:
+            return  # Malformed frontmatter
+
+        # Parse existing frontmatter fields
+        fm_lines = lines[1:end_idx]
+        existing_keys = set()
+        for line in fm_lines:
+            stripped = line.strip()
+            if ":" in stripped:
+                key = stripped.split(":", 1)[0].strip()
+                existing_keys.add(key)
+
+        # Build fields to inject (only if not already present)
+        inject = []
+        if "improvable" not in existing_keys:
+            inject.append("improvable: true\n")
+        if "registry" not in existing_keys:
+            inject.append(f'registry: "@{namespace}/{name}"\n')
+
+        if inject:
+            # Insert before closing ---
+            new_lines = lines[:end_idx] + inject + lines[end_idx:]
+            skill_md.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _install_to_target(
     args: argparse.Namespace,
     namespace: str,
@@ -2288,6 +2423,7 @@ def _install_to_target(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     _update_lockfile(namespace, name, version, tree_hash)
 
 
@@ -2342,6 +2478,7 @@ def _install_to_target_archive(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     _update_lockfile(namespace, name, version, tree_hash)
 
 
@@ -2463,9 +2600,12 @@ def cmd_info(args: argparse.Namespace) -> None:
     print()
 
 
-def _list_skills_in_dir(directory: Path) -> List[Tuple[str, str]]:
-    """List skills in a flat skills directory (each subdirectory is a skill)."""
-    results: List[Tuple[str, str]] = []
+def _list_skills_in_dir(directory: Path) -> List[Tuple[str, str, str]]:
+    """List skills in a flat skills directory (each subdirectory is a skill).
+
+    Returns list of (name, description, version) tuples.
+    """
+    results: List[Tuple[str, str, str]] = []
     if not directory.is_dir():
         return results
     for skill_dir in sorted(directory.iterdir()):
@@ -2482,7 +2622,17 @@ def _list_skills_in_dir(directory: Path) -> List[Tuple[str, str]]:
                         break
             except Exception:
                 pass
-        results.append((skill_dir.name, desc))
+        # Read version from .skillsafe.json
+        ver = ""
+        meta_path = skill_dir / ".skillsafe.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                ver = meta.get("version", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+        results.append((skill_dir.name, desc, ver))
     return results
 
 
@@ -2498,10 +2648,10 @@ def cmd_list(args: argparse.Namespace) -> None:
         if skills:
             found_any = True
             print(f"{bold(f'{label} skills')} ({agent_dir}):\n")
-            print(f"  {'SKILL':<30} DESCRIPTION")
-            print(f"  {'─' * 30} {'─' * 50}")
-            for name, desc in skills:
-                print(f"  {name:<30} {desc}")
+            print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+            print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+            for name, desc, ver in skills:
+                print(f"  {name:<30} {ver or '-':<10} {desc}")
             print()
 
     # 2. Custom --skills-dir paths
@@ -2512,10 +2662,10 @@ def cmd_list(args: argparse.Namespace) -> None:
         if skills:
             found_any = True
             print(f"{bold('Skills')} ({extra_path}):\n")
-            print(f"  {'SKILL':<30} DESCRIPTION")
-            print(f"  {'─' * 30} {'─' * 50}")
-            for name, desc in skills:
-                print(f"  {name:<30} {desc}")
+            print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+            print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+            for name, desc, ver in skills:
+                print(f"  {name:<30} {ver or '-':<10} {desc}")
             print()
 
     # 3. SkillSafe registry skills (~/.skillsafe/skills/)
@@ -2564,10 +2714,10 @@ def cmd_list(args: argparse.Namespace) -> None:
                 found_any = True
                 label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
                 print(f"{bold(f'Project skills ({label})')} ({project_skills_dir}):\n")
-                print(f"  {'SKILL':<30} DESCRIPTION")
-                print(f"  {'─' * 30} {'─' * 50}")
-                for name, desc in proj_skills:
-                    print(f"  {name:<30} {desc}")
+                print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+                print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+                for name, desc, ver in proj_skills:
+                    print(f"  {name:<30} {ver or '-':<10} {desc}")
                 print()
 
     if not found_any:
@@ -2579,349 +2729,6 @@ def cmd_list(args: argparse.Namespace) -> None:
         print(f"  {'SkillSafe skills dir:':<25} {SKILLS_DIR}")
         print(f"  {'Project skills dirs:':<25} ./<tool>/skills/")
 
-
-def cmd_backup(args: argparse.Namespace) -> None:
-    """Back up a local skill to the SkillSafe registry (private, auto-versioned)."""
-    cfg = require_config()
-    skill_path = Path(args.path).resolve()
-
-    if not skill_path.is_dir():
-        print(f"Error: {skill_path} is not a directory.", file=sys.stderr)
-        sys.exit(1)
-
-    name = args.name if hasattr(args, "name") and args.name else skill_path.name
-    namespace = cfg["username"]
-
-    _validate_skill_name(name)
-
-    if name in RESERVED_SKILL_NAMES:
-        print(f"  '{name}' is reserved and has no need to backup.")
-        return
-
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
-
-    # Step 1: Resolve version
-    version: Optional[str] = getattr(args, "version", None)
-    if not version:
-        print(f"Resolving next version of {bold(f'@{namespace}/{name}')}...")
-        version = client.resolve_next_version(namespace, name)
-    print(f"Backing up {bold(f'@{namespace}/{name}')} v{version}...\n")
-
-    # Step 2: Build file manifest
-    print("  Building file manifest...")
-    file_manifest = build_file_manifest(skill_path)
-    total_size = sum(f["size"] for f in file_manifest)
-    total_size_kb = total_size / 1024
-
-    if total_size > MAX_ARCHIVE_SIZE:
-        print(f"Error: Total file size is {total_size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
-        sys.exit(1)
-    print(f"  Files: {len(file_manifest)}, total size: {total_size_kb:.1f} KB")
-
-    # Step 3: Compute v2 tree hash
-    tree_hash = compute_tree_hash_v2(file_manifest)
-    print(f"  Tree hash:    {dim(tree_hash[:30])}...")
-
-    # Step 3b: Check if latest version already has the same tree hash (no changes)
-    try:
-        meta = client.get_metadata(namespace, name, auth=True)
-        latest_ver = meta.get("latest_version")
-        if latest_ver:
-            versions_resp = client.get_versions(namespace, name, limit=1)
-            versions_data = versions_resp.get("data", [])
-            versions = versions_data if isinstance(versions_data, list) else []
-            if versions and versions[0].get("tree_hash") == tree_hash:
-                print(green(f"\n  No changes detected — latest version v{latest_ver} already has the same content."))
-                print(f"  Skipping backup.")
-                return
-    except SkillSafeError:
-        pass  # Skill doesn't exist yet, proceed with first backup
-
-    # Step 4: Scan
-    print("  Scanning for security issues...")
-    scanner = Scanner()
-    report = scanner.scan(skill_path, tree_hash=tree_hash)
-    _print_scan_results(report, indent=2)
-
-    # Step 5: Negotiate delta upload
-    print("\n  Negotiating upload...")
-    try:
-        negotiate_result = client.negotiate(namespace, name, version, file_manifest)
-        needed_files = negotiate_result.get("needed_files", [])
-        existing_blobs = negotiate_result.get("existing_blobs", [])
-    except SkillSafeError as e:
-        print(f"\n  Error: {e.message}", file=sys.stderr)
-        sys.exit(1)
-
-    needed_bytes = sum(f["size"] for f in file_manifest if f["path"] in needed_files)
-    print(f"  Need to upload: {len(needed_files)} file(s) ({needed_bytes / 1024:.1f} KB)")
-    if existing_blobs:
-        print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
-
-    # Step 6: Save to registry via v2 (with retry)
-    print("  Uploading to registry...")
-    metadata: Dict[str, Any] = {"version": version}
-
-    max_retries = 3
-    result = None
-    version_resolved = False
-    for attempt in range(max_retries):
-        try:
-            result = client.save_v2(
-                namespace, name, metadata, file_manifest, needed_files, skill_path,
-                scan_report_json=json.dumps(report),
-            )
-            break  # Success
-        except SkillSafeError as e:
-            # Handle version collision: re-resolve version and retry once
-            if (e.status == 409 or e.status == 422) and not version_resolved:
-                version_resolved = True
-                print(f"  Version {version} conflict, re-resolving...")
-                version = client.resolve_next_version(namespace, name)
-                metadata["version"] = version
-                # Re-negotiate with new version (needed_files may differ)
-                try:
-                    negotiate_result = client.negotiate(namespace, name, version, file_manifest)
-                    needed_files = negotiate_result.get("needed_files", [])
-                except SkillSafeError as e_neg:
-                    print(f"\n  Error: {e_neg.message}", file=sys.stderr)
-                    sys.exit(1)
-                continue
-            # 429 Rate Limit: respect Retry-After
-            if e.status == 429 and e.retry_after and attempt < max_retries - 1:
-                print(yellow(f"\n  Rate limited, retrying in {e.retry_after}s..."))
-                time.sleep(e.retry_after)
-                continue
-            # Non-retryable client errors (4xx except 429)
-            if 400 <= e.status < 500:
-                print(f"\n  Error: {e.message}", file=sys.stderr)
-                sys.exit(1)
-            # Retryable server errors (5xx) or unknown
-            if attempt < max_retries - 1:
-                delay = 2 ** attempt  # 1s, 2s
-                print(yellow(f"\n  Upload failed ({e.code}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
-                time.sleep(delay)
-            else:
-                print(f"\n  Error: {e.message}", file=sys.stderr)
-                sys.exit(1)
-        except (urllib.error.URLError, OSError) as e:
-            if attempt < max_retries - 1:
-                delay = 2 ** attempt  # 1s, 2s
-                print(yellow(f"\n  Upload failed ({type(e).__name__}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
-                time.sleep(delay)
-            else:
-                print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
-                sys.exit(1)
-
-    if result is None:
-        print("Error: Upload failed after all retries.", file=sys.stderr)
-        sys.exit(1)
-
-    # Post-upload tree hash verification
-    server_tree_hash = result.get("tree_hash")
-    local_tree_hash = compute_tree_hash_v2(file_manifest)
-
-    if server_tree_hash != local_tree_hash:
-        print(yellow(f"\n  Warning: Tree hash mismatch!"))
-        print(f"    Local:  {local_tree_hash}")
-        print(f"    Server: {server_tree_hash}")
-        print(f"  This may indicate server processing issues or tampering.")
-        print(f"\n  Backed up @{namespace}/{name}@{version}")
-        print(f"  Skill ID:   {result.get('skill_id')}")
-        print(f"  Version ID: {result.get('version_id')}")
-    else:
-        print(green(f"\n  Backed up @{namespace}/{name}@{version}"))
-        print(f"  Skill ID:   {result.get('skill_id')}")
-        print(f"  Version ID: {result.get('version_id')}")
-        print(f"  Tree hash:  {server_tree_hash} (verified)")
-    if result.get("new_bytes") is not None:
-        print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
-    print(f"  Restore with: skillsafe restore @{namespace}/{name}")
-
-
-def cmd_restore(args: argparse.Namespace) -> None:
-    """Restore a skill from the registry."""
-    cfg = require_config()
-    namespace = cfg["username"]
-
-    # Parse skill name
-    ref = args.name
-    if "/" in ref:
-        ref = ref.lstrip("@")
-        parts = ref.split("/", 1)
-        namespace = parts[0]
-        skill_name = parts[1]
-    else:
-        skill_name = ref
-
-    # Sanitize namespace and name to prevent path traversal
-    _restore_ident_re = r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$'
-    if not re.match(_restore_ident_re, namespace):
-        print(f"Error: Invalid namespace '{namespace}'", file=sys.stderr)
-        sys.exit(1)
-    if not re.match(_restore_ident_re, skill_name):
-        print(f"Error: Invalid skill name '{skill_name}'", file=sys.stderr)
-        sys.exit(1)
-
-    # Determine target directory
-    skills_dir = _resolve_skills_dir(args)
-    if skills_dir:
-        target_dir = skills_dir / skill_name
-    elif getattr(args, "output", None):
-        target_dir = Path(args.output).resolve()
-    else:
-        target_dir = Path.cwd() / skill_name
-
-    print(f"Restoring {bold(f'@{namespace}/{skill_name}')} to {target_dir}...\n")
-
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
-
-    # Download from registry
-    try:
-        meta = client.get_metadata(namespace, skill_name, auth=True)
-        version = meta.get("latest_version")
-        if not version:
-            print("Error: No versions found.", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"  Downloading v{version} from registry...")
-        dl_format, dl_data = client.download(namespace, skill_name, version)
-    except SkillSafeError as e:
-        print(f"  Error: {e.message}", file=sys.stderr)
-        sys.exit(1)
-    except (urllib.error.URLError, OSError) as e:
-        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # ---------- V2 path (file manifest) ----------
-
-    if dl_format == "files":
-        manifest = dl_data
-        print(f"  Received v2 manifest: {len(manifest.get('files', []))} file(s)")
-
-        # Reconstruct into temp dir, scan, then copy to target
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            print("  Reconstructing skill from manifest...")
-            try:
-                local_tree_hash, cached_count, downloaded_count = install_from_manifest(
-                    client, manifest, tmppath, verbose=True
-                )
-            except SkillSafeError as e:
-                print(f"\n  Error: {e.message}", file=sys.stderr)
-                sys.exit(1)
-
-            print(f"  Files: {downloaded_count} downloaded, {cached_count} from cache")
-            print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
-
-            # Scan restored files
-            print("  Scanning restored skill...")
-            scanner = Scanner()
-            scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(scan_report, indent=2)
-
-            if not scan_report.get("clean", True):
-                print(yellow("\n  WARNING: Security issues found in restored skill."))
-
-            # Submit verification
-            print("\n  Submitting verification report...")
-            try:
-                verify_resp = client.verify(namespace, skill_name, version, scan_report)
-                verify_verdict = verify_resp.get("verdict", "unknown")
-                if verify_verdict == "verified":
-                    print(green("  Verified: publisher and consumer scans match."))
-                elif verify_verdict == "critical":
-                    print(red("  CRITICAL: Tree hash mismatch detected by server!"))
-                    print("  Aborting restore.")
-                    sys.exit(1)
-                elif verify_verdict == "divergent":
-                    print(yellow("  WARNING: Scan reports diverge."))
-            except SkillSafeError as e:
-                if e.status == 403:
-                    pass  # Expected for self-restore
-                else:
-                    print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
-
-            # Copy to final target directory (skip symlinks for safety)
-            target_dir.mkdir(parents=True, exist_ok=True)
-            print(f"  Copying to {target_dir}...")
-            for item in tmppath.iterdir():
-                dest = target_dir / item.name
-                if item.is_symlink():
-                    continue  # Skip symlinks — never restore them
-                if item.is_dir():
-                    if dest.exists():
-                        shutil.rmtree(dest)
-                    shutil.copytree(item, dest, symlinks=False)
-                else:
-                    shutil.copy2(item, dest)
-
-    # ---------- V1 path (archive) ----------
-
-    else:
-        archive_bytes, server_tree_hash = dl_data
-
-        # Verify tree hash
-        local_tree_hash = compute_tree_hash(archive_bytes)
-        if not server_tree_hash:
-            print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
-            print("Aborting restore for safety.", file=sys.stderr)
-            sys.exit(1)
-        if local_tree_hash != server_tree_hash:
-            print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
-            print(f"    Server:  {server_tree_hash}")
-            print(f"    Local:   {local_tree_hash}")
-            print("  Aborting restore.")
-            sys.exit(1)
-        print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
-        print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
-
-        # Extract to temp dir and scan before moving to target
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            print("  Extracting to temporary directory...")
-            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                _safe_extractall(tar, tmppath)
-
-            # Scan restored files for security issues (warn but don't block)
-            print("  Scanning restored skill...")
-            scanner = Scanner()
-            scan_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(scan_report, indent=2)
-
-            if not scan_report.get("clean", True):
-                print(yellow("\n  WARNING: Security issues found in restored skill."))
-
-            # Submit verification report (dual-side verification)
-            print("\n  Submitting verification report...")
-            try:
-                verify_resp = client.verify(namespace, skill_name, version, scan_report)
-                verify_verdict = verify_resp.get("verdict", "unknown")
-                if verify_verdict == "verified":
-                    print(green("  Verified: publisher and consumer scans match."))
-                elif verify_verdict == "critical":
-                    print(red("  CRITICAL: Tree hash mismatch detected by server!"))
-                    print("  Aborting restore.")
-                    sys.exit(1)
-                elif verify_verdict == "divergent":
-                    print(yellow("  WARNING: Scan reports diverge."))
-            except SkillSafeError as e:
-                if e.status == 403:
-                    pass  # Expected for self-restore
-                else:
-                    print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
-
-            # Extract to final target directory
-            target_dir.mkdir(parents=True, exist_ok=True)
-            print(f"  Extracting to {target_dir}...")
-            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                _safe_extractall(tar, target_dir)
-
-    print(green(f"\n  Restored @{namespace}/{skill_name}"))
-    print(f"  Location: {target_dir}")
-
-    if skills_dir:
-        print(f"\n  Skill is now available in: {skills_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -3077,7 +2884,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # -- save ---------------------------------------------------------------
     p_save = subparsers.add_parser("save", help="Save a skill to the registry (private by default)")
     p_save.add_argument("path", help="Path to the skill directory")
-    p_save.add_argument("--version", required=True, help="Semantic version (e.g. 1.0.0)")
+    p_save.add_argument("--version", help="Semantic version (e.g. 1.0.0). Omit to auto-increment patch.")
     p_save.add_argument("--description", help="Skill description")
     p_save.add_argument("--category", help="Skill category")
     p_save.add_argument("--tags", help="Comma-separated tags")
@@ -3113,21 +2920,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     # -- list ---------------------------------------------------------------
     p_list = subparsers.add_parser("list", help="List locally installed skills")
     p_list.add_argument("--skills-dir", action="append", help="Additional skills directory to scan (can be repeated)")
-
-    # -- backup -------------------------------------------------------------
-    p_backup = subparsers.add_parser("backup", help="Back up a skill directory to the registry (private, auto-versioned)")
-    p_backup.add_argument("path", help="Path to the skill directory to back up")
-    p_backup.add_argument("--name", help="Skill name (default: directory name)")
-    p_backup.add_argument("--version", help="Explicit version (default: auto-increment from latest)")
-
-    # -- restore ------------------------------------------------------------
-    p_restore = subparsers.add_parser("restore", help="Restore a skill from the registry")
-    p_restore.add_argument("name", help="Skill name or @namespace/name")
-    restore_target = p_restore.add_mutually_exclusive_group()
-    restore_target.add_argument("--skills-dir", help="Restore into a custom skills directory")
-    restore_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
-        help="Restore into a known tool's skills dir (claude, cursor, windsurf, openclaw)")
-    p_restore.add_argument("-o", "--output", help="Restore to a specific directory")
 
     # -- yank ---------------------------------------------------------------
     p_yank = subparsers.add_parser("yank", help="Yank a version (blocks future downloads)")
@@ -3168,10 +2960,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_info(args)
     elif args.command == "list":
         cmd_list(args)
-    elif args.command == "backup":
-        cmd_backup(args)
-    elif args.command == "restore":
-        cmd_restore(args)
     elif args.command == "yank":
         cmd_yank(args)
     elif args.command == "whoami":

@@ -42,9 +42,9 @@ Runs 4 scan passes:
 
 ### Save — Save a skill to the registry (private by default)
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path> --version <semver> [--description <d>] [--category <c>] [--tags <t>] [--changelog <msg>]
+python3 <skill-dir>/scripts/skillsafe.py save <path> [--version <semver>] [--description <d>] [--category <c>] [--tags <t>] [--changelog <msg>]
 ```
-Scans the skill, creates a tar.gz archive, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required. Use `--changelog` to describe what changed in this version (shown in `info`).
+Scans the skill, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required. Use `--changelog` to describe what changed in this version (shown in `info`). If `--version` is omitted, the CLI auto-increments the patch version from the latest (e.g., 1.0.2 → 1.0.3). If the skill's content is unchanged from the latest version, the save is skipped.
 
 ### Share — Create a share link for a saved skill
 ```bash
@@ -57,6 +57,8 @@ Creates a share link for a specific version. By default the link is private (onl
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
 Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. Use `--tool <name>` to install into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
+
+After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash. The installer also injects `improvable: true` and `registry` fields into the skill's SKILL.md frontmatter if not already present.
 
 ### Search — Search the registry
 ```bash
@@ -81,18 +83,6 @@ python3 <skill-dir>/scripts/skillsafe.py list
 ```
 Shows skills from multiple locations: known tool directories (`~/.claude/skills/`, `~/.cursor/skills/`, `~/.windsurf/skills/`), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
 
-### Backup — Back up a skill to the vault
-```bash
-python3 <skill-dir>/scripts/skillsafe.py backup <path> [--name <vault-name>]
-```
-Creates a tar.gz archive of a skill directory and uploads it to the SkillSafe vault for safe cloud backup. Useful for backing up skills before modifying them.
-
-### Restore — Restore a skill from the vault
-```bash
-python3 <skill-dir>/scripts/skillsafe.py restore <name> [--skills-dir <dir>] [--tool <name>] [-o <dir>]
-```
-Downloads a skill from the vault and extracts it. Use `--tool <name>` to restore into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`). Use `--skills-dir <path>` for a custom path.
-
 ## Improving & Iterating on Skills
 
 Use this workflow when the user wants to edit an existing skill, publish a new version, or roll back to an older one.
@@ -100,53 +90,136 @@ Use this workflow when the user wants to edit an existing skill, publish a new v
 ### Step 1 — Install locally for editing
 
 ```bash
-# Install into a tool directory (edit in place)
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --tool claude
-
-# OR: install to a local project directory (skill lands in <parent-dir>/<name>)
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --skills-dir <parent-dir>
 ```
 
-### Step 2 — Find the current version
+After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
 
-**Always run `info` before saving a new version — never guess or increment the version without checking the current one first.**
-
-```bash
-python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
-# Note "latest_version" (e.g. 1.0.2)
-# Next patch → 1.0.3 | next minor → 1.1.0 | next major → 2.0.0
-```
-
-### Step 3 — Edit the skill
+### Step 2 — Edit the skill
 
 Read and modify `SKILL.md` (instructions) and any supporting files in the installed directory. Base improvements on user feedback about what worked or didn't. If unsure where the skill was installed, run `list` to find the path.
 
-### Step 4 — Publish the improved version
+### Step 3 — Save the improved version
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --version <new-version> --changelog "what changed"
-# path is wherever the skill was installed (check with `list` if unsure)
+python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --changelog "[type] what changed"
 ```
 
-### Step 5 — Optionally share
+No `--version` needed — the CLI auto-increments the patch version. If the content is unchanged, the save is skipped. Use changelog prefixes to categorize: `[example]`, `[patch]`, `[instruction]`, `[bugfix]`.
+
+### Step 4 — Optionally share
 
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py share @<namespace>/<name> --version <new-version> [--public]
 ```
 
-### Step 6 — Revert to a previous version if needed
+### Step 5 — Revert to a previous version if needed
 
 ```bash
-# See all available versions
-python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
-
-# Reinstall the preferred older version
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --version <old-version> --tool claude
 ```
 
+## Self-Improving Skills
+
+Skills can self-improve based on usage feedback. When a skill has `improvable: true` in its frontmatter, the main agent orchestrates an observe-improve-save loop after each execution.
+
+### Frontmatter Fields
+
+Add these optional fields to opt into self-improvement:
+
+```yaml
+---
+name: my-skill
+description: What this skill does
+context: fork
+improvable: true
+registry: "@namespace/skill-name"
+allowed-tools: Bash, Read, Write
+---
+```
+
+- **`improvable: true`** — Signals that this skill opts into the self-improvement loop. When present, the main agent observes execution and user feedback, then edits and saves a new version when warranted.
+- **`registry: "@ns/name"`** — The skill's registry coordinates. Used by the auto-save flow so the agent doesn't need to derive namespace and name separately. Read from `.skillsafe.json` if not in frontmatter.
+- **`context: fork`** — Skills should run in a sub-agent (separate context) so the main agent can observe the full execution and user reaction without being inside the skill's execution flow.
+
+### How It Works
+
+1. **Sub-agent execution**: The main agent reads the skill's SKILL.md and spawns a sub-agent with `context: fork`. The sub-agent executes the skill instructions and returns the result.
+
+2. **Feedback detection**: After the sub-agent completes, the main agent observes the user's next 1-3 messages for feedback signals:
+   - **Positive**: user says "thanks", "good job", "perfect", or proceeds without corrections
+   - **Negative**: user says "wrong", "no", "try again", manually corrects output, or asks for a different approach
+   - **Error recovery**: the sub-agent hit a tool error (e.g., command not found) and used a workaround
+
+3. **Improvement**: When feedback warrants it, the main agent edits the skill files directly:
+   - **Add examples** — append successful (input, output) pairs to a `## Examples` section in SKILL.md
+   - **Patch scripts** — fix commands that failed (e.g., replace `jq` with `python3 -m json.tool` when jq is missing)
+   - **Fix instructions** — clarify SKILL.md text based on user corrections
+
+4. **Save new version**: The main agent saves the improved skill:
+   ```bash
+   python3 <skillsafe-cli>/scripts/skillsafe.py save <skill-dir> --changelog "[patch] replaced jq with python3 fallback"
+   ```
+   The version auto-increments. The changelog describes what was improved and why.
+
+5. **Confirm to user**: The main agent tells the user what was improved and the new version number.
+
+### Changelog Convention
+
+Use a bracketed prefix to categorize improvement type:
+- `[example]` — Added a concrete example of correct behavior
+- `[patch]` — Fixed a script or command (tool fallback, error handling, platform compatibility)
+- `[instruction]` — Clarified or corrected SKILL.md instructions
+- `[bugfix]` — Fixed a bug in the skill's logic
+
+### Skill Template Sections
+
+Skills that opt into self-improvement should include these optional sections:
+
+#### Feedback Signals
+
+Define what counts as positive/negative feedback specific to this skill:
+
+```markdown
+## Feedback Signals
+
+### Positive
+- User accepts the generated output without edits
+- Tests pass after the skill's changes
+
+### Negative
+- User reverts the skill's changes
+- Tests fail after the skill's changes
+- User says the output format is wrong
+```
+
+#### Improvement Guide
+
+Define what types of improvements the main agent should make:
+
+```markdown
+## Improvement Guide
+
+### When a command fails
+Add platform detection and fallback commands. Prefer widely-available tools.
+
+### When output format is wrong
+Add a concrete example to the Examples section showing the correct format.
+
+### When instructions are misunderstood
+Add DO and DO NOT lists to clarify edge cases.
+```
+
+### Rate Limiting
+
+To avoid rapid-fire saves:
+- Only improve after explicit user feedback, not on every sub-agent error
+- Maximum one improvement save per skill per conversation
+- If the same skill fails after an improvement, ask the user before making another edit
+
 ## How to Use
 
-When the user asks to scan, save, share, install, list, backup, or search for skills:
+When the user asks to scan, save, share, install, list, or search for skills:
 
 1. Determine which command to run based on the user's request
 2. Run the appropriate command using `Bash`
@@ -156,14 +229,12 @@ Common user requests and which command to use:
 - "sign in" / "log in" / "authenticate" -> `auth`
 - "list my skills" / "what skills do I have" -> `list`
 - "scan this for security issues" -> `scan <path>`
-- "save my skill" / "upload my skill" -> `save <path> --version <ver>`
+- "save my skill" / "upload my skill" -> `save <path>` (auto-versions) or `save <path> --version <ver>`
 - "share my skill" / "publish my skill" -> `share @ns/name --version <ver>` (add `--public` for search visibility)
 - "install a skill" -> `install @ns/name --tool <name>` (or `--skills-dir <path>`)
-- "back up my skill" -> `backup <path>`
-- "restore my skill" -> `restore <name> --tool <name>` (or `--skills-dir <path>`)
 - "improve this skill" / "make this skill better" / "update the skill instructions" -> edit + save workflow (see "Improving & Iterating on Skills")
-- "push a new version" / "publish my changes" -> `save <path> --version <next>`
-- "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `info @ns/name` to list versions, then `install @ns/name --version <old>`
+- "push a new version" / "publish my changes" -> `save <path> --changelog "what changed"`
+- "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old> --tool claude`
 - "yank this version" / "block this version" / "this version is broken" -> `yank @ns/name --version <ver> --reason "..."`
 
 ## Configuration
