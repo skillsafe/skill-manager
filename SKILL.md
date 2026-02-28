@@ -18,6 +18,8 @@ mkdir -p <skill-dir>/scripts && curl -fsSL https://skillsafe.ai/scripts/skillsaf
 
 This is only needed for first-time installation from URL. If installed via `skillsafe install`, the script is already included.
 
+**Installing into the current tool's skills directory:** Use `--tool <name>` for known tools (`claude`, `cursor`, `windsurf`, `openclaw`). If you are running inside a different tool not listed here, use `--skills-dir <path>` with the tool's skills directory path instead — do not attempt to write files directly outside the tool's workspace.
+
 ## Available Commands
 
 Run all commands using `python3` and the script at `scripts/skillsafe.py` inside this skill's directory.
@@ -54,7 +56,7 @@ Creates a share link for a specific version. By default the link is private (onl
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
-Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. Use `--tool <name>` to install into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`). Use `--skills-dir <path>` for a custom path.
+Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. Use `--tool <name>` to install into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
 
 ### Search — Search the registry
 ```bash

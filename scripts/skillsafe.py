@@ -107,11 +107,13 @@ TOOL_SKILLS_DIRS: Dict[str, Path] = {
     "claude": Path.home() / ".claude" / "skills",
     "cursor": Path.home() / ".cursor" / "skills",
     "windsurf": Path.home() / ".windsurf" / "skills",
+    "openclaw": Path.home() / ".openclaw" / "workspace" / "skills",
 }
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "claude": "Claude Code",
     "cursor": "Cursor",
     "windsurf": "Windsurf",
+    "openclaw": "OpenClaw",
 }
 
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -3095,7 +3097,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     install_target = p_install.add_mutually_exclusive_group()
     install_target.add_argument("--skills-dir", help="Install into a custom skills directory")
     install_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
-        help="Install into a known tool's skills dir (claude, cursor, windsurf)")
+        help="Install into a known tool's skills dir (claude, cursor, windsurf, openclaw)")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")
@@ -3124,7 +3126,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     restore_target = p_restore.add_mutually_exclusive_group()
     restore_target.add_argument("--skills-dir", help="Restore into a custom skills directory")
     restore_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
-        help="Restore into a known tool's skills dir (claude, cursor, windsurf)")
+        help="Restore into a known tool's skills dir (claude, cursor, windsurf, openclaw)")
     p_restore.add_argument("-o", "--output", help="Restore to a specific directory")
 
     # -- yank ---------------------------------------------------------------
