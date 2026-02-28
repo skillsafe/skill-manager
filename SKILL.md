@@ -101,6 +101,8 @@ python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> -o ./<name>
 
 ### Step 2 — Find the current version
 
+**Always run `info` before saving a new version — never guess or increment the version without checking the current one first.**
+
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
 # Note "latest_version" (e.g. 1.0.2)
@@ -109,7 +111,7 @@ python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
 
 ### Step 3 — Edit the skill
 
-Read and modify `SKILL.md` (instructions) and any supporting files in the installed directory. Base improvements on user feedback about what worked or didn't.
+Read and modify `SKILL.md` (instructions) and any supporting files in the installed directory. Base improvements on user feedback about what worked or didn't. If unsure where the skill was installed, run `list` to find the path.
 
 ### Step 4 — Publish the improved version
 
