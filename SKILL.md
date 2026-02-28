@@ -40,9 +40,9 @@ Runs 4 scan passes:
 
 ### Save — Save a skill to the registry (private by default)
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path> --version <semver> [--description <d>] [--category <c>] [--tags <t>]
+python3 <skill-dir>/scripts/skillsafe.py save <path> --version <semver> [--description <d>] [--category <c>] [--tags <t>] [--changelog <msg>]
 ```
-Scans the skill, creates a tar.gz archive, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required.
+Scans the skill, creates a tar.gz archive, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required. Use `--changelog` to describe what changed in this version (shown in `info`).
 
 ### Share — Create a share link for a saved skill
 ```bash
@@ -61,6 +61,12 @@ Downloads the archive, verifies the tree hash matches, scans the downloaded file
 python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--sort popular|recent|verified|trending|hot]
 ```
 Searches publicly shared skills only.
+
+### Yank — Block downloads of a broken version
+```bash
+python3 <skill-dir>/scripts/skillsafe.py yank @<namespace>/<skill-name> --version <ver> [--reason <msg>]
+```
+Marks a version as yanked — it remains visible in `info` but cannot be downloaded. Use when a published version has a bug or security issue. Other versions are unaffected.
 
 ### Info — Get skill details
 ```bash
@@ -116,7 +122,7 @@ Read and modify `SKILL.md` (instructions) and any supporting files in the instal
 ### Step 4 — Publish the improved version
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --version <new-version>
+python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --version <new-version> --changelog "what changed"
 # path is wherever the skill was installed (check with `list` if unsure)
 ```
 
@@ -156,6 +162,7 @@ Common user requests and which command to use:
 - "improve this skill" / "make this skill better" / "update the skill instructions" -> edit + save workflow (see "Improving & Iterating on Skills")
 - "push a new version" / "publish my changes" -> `save <path> --version <next>`
 - "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `info @ns/name` to list versions, then `install @ns/name --version <old>`
+- "yank this version" / "block this version" / "this version is broken" -> `yank @ns/name --version <ver> --reason "..."`
 
 ## Configuration
 

@@ -1122,6 +1122,20 @@ class SkillSafeClient:
         )
         return resp.get("data", resp)
 
+    def yank(self, namespace: str, name: str, version: str, reason: str = "") -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{version}/yank — yank a version."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        body = json.dumps({"reason": reason}).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/yank",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
     def download_via_share(self, share_id: str):
         """
         GET /v1/share/{share_id}/download — download via share link.
@@ -1835,6 +1849,8 @@ def cmd_save(args: argparse.Namespace) -> None:
 
     # Step 5: Save to registry via v2
     print("  Uploading to registry...")
+    changelog: Optional[str] = getattr(args, "changelog", None)
+
     metadata: Dict[str, Any] = {"version": version}
     if description:
         metadata["description"] = description
@@ -1842,6 +1858,8 @@ def cmd_save(args: argparse.Namespace) -> None:
         metadata["category"] = category
     if tags_raw:
         metadata["tags"] = [t.strip() for t in tags_raw.split(",")]
+    if changelog:
+        metadata["changelog"] = changelog
 
     max_retries = 3
     result = None
@@ -2364,6 +2382,35 @@ def cmd_search(args: argparse.Namespace) -> None:
         installs = s.get("install_count", 0)
         desc = (s.get("description") or "")[:40]
         print(f"  {ref:<35} {ver:<10} {stars:<7} {installs:<10} {desc}")
+
+
+def cmd_yank(args: argparse.Namespace) -> None:
+    """Yank a specific version of a skill (blocks future downloads of that version)."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+    reason: str = getattr(args, "reason", "") or ""
+
+    print(f"Yanking {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        client.yank(namespace, name, version, reason=reason)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(yellow(f"  Yanked @{namespace}/{name}@{version}"))
+    if reason:
+        print(f"  Reason: {reason}")
+    print(f"\n  This version is now blocked from download.")
+    print(f"  Other versions of the skill remain available.")
+    print(f"\n  To install a different version:")
+    print(f"    skillsafe install @{namespace}/{name} --version <other-version>")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
@@ -3032,6 +3079,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_save.add_argument("--description", help="Skill description")
     p_save.add_argument("--category", help="Skill category")
     p_save.add_argument("--tags", help="Comma-separated tags")
+    p_save.add_argument("--changelog", help="What changed in this version")
 
     # -- share --------------------------------------------------------------
     p_share = subparsers.add_parser("share", help="Create a share link for a saved skill")
@@ -3079,6 +3127,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Restore into a known tool's skills dir (claude, cursor, windsurf)")
     p_restore.add_argument("-o", "--output", help="Restore to a specific directory")
 
+    # -- yank ---------------------------------------------------------------
+    p_yank = subparsers.add_parser("yank", help="Yank a version (blocks future downloads)")
+    p_yank.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_yank.add_argument("--version", required=True, help="Version to yank (e.g. 1.0.0)")
+    p_yank.add_argument("--reason", help="Reason for yanking (shown in version listings)")
+
     # -- whoami -------------------------------------------------------------
     p_whoami = subparsers.add_parser("whoami", help="Show current authentication status and account info")
 
@@ -3116,6 +3170,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_backup(args)
     elif args.command == "restore":
         cmd_restore(args)
+    elif args.command == "yank":
+        cmd_yank(args)
     elif args.command == "whoami":
         cmd_whoami(args)
     else:
