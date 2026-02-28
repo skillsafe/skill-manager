@@ -95,8 +95,8 @@ Use this workflow when the user wants to edit an existing skill, publish a new v
 # Install into a tool directory (edit in place)
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --tool claude
 
-# OR: install to a local project directory
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> -o ./<name>
+# OR: install to a local project directory (skill lands in <parent-dir>/<name>)
+python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --skills-dir <parent-dir>
 ```
 
 ### Step 2 — Find the current version

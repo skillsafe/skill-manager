@@ -1227,11 +1227,11 @@ class SkillSafeClient:
         except SkillSafeError:
             return "0.1.0"
 
-    def get_versions(self, namespace: str, name: str, limit: int = 20) -> Dict[str, Any]:
+    def get_versions(self, namespace: str, name: str, limit: int = 20, auth: bool = False) -> Dict[str, Any]:
         """GET /v1/skills/@{ns}/{name}/versions — version list."""
         ns = self._encode_path_segment(namespace)
         nm = self._encode_path_segment(name)
-        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}/versions?limit={limit}", auth=False)
+        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}/versions?limit={limit}", auth=auth)
         return resp
 
     def download_blob(self, blob_hash: str) -> bytes:
@@ -2370,10 +2370,10 @@ def cmd_info(args: argparse.Namespace) -> None:
     """Show detailed information about a skill."""
     namespace, name = parse_skill_ref(args.skill)
     cfg = load_config()
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE))
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key"))
 
     try:
-        meta = client.get_metadata(namespace, name)
+        meta = client.get_metadata(namespace, name, auth=True)
     except SkillSafeError as e:
         print(f"Error: {e.message}", file=sys.stderr)
         sys.exit(1)
@@ -2397,7 +2397,7 @@ def cmd_info(args: argparse.Namespace) -> None:
 
     # Fetch versions
     try:
-        ver_resp = client.get_versions(namespace, name, limit=10)
+        ver_resp = client.get_versions(namespace, name, limit=10, auth=True)
         versions = ver_resp.get("data", [])
         if versions:
             print(f"\n  Recent versions:")
