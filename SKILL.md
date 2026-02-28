@@ -85,6 +85,55 @@ python3 <skill-dir>/scripts/skillsafe.py restore <name> [--skills-dir <dir>] [--
 ```
 Downloads a skill from the vault and extracts it. Use `--tool <name>` to restore into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`). Use `--skills-dir <path>` for a custom path.
 
+## Improving & Iterating on Skills
+
+Use this workflow when the user wants to edit an existing skill, publish a new version, or roll back to an older one.
+
+### Step 1 — Install locally for editing
+
+```bash
+# Install into a tool directory (edit in place)
+python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --tool claude
+
+# OR: install to a local project directory
+python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> -o ./<name>
+```
+
+### Step 2 — Find the current version
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
+# Note "latest_version" (e.g. 1.0.2)
+# Next patch → 1.0.3 | next minor → 1.1.0 | next major → 2.0.0
+```
+
+### Step 3 — Edit the skill
+
+Read and modify `SKILL.md` (instructions) and any supporting files in the installed directory. Base improvements on user feedback about what worked or didn't.
+
+### Step 4 — Publish the improved version
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --version <new-version>
+# path is wherever the skill was installed (check with `list` if unsure)
+```
+
+### Step 5 — Optionally share
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py share @<namespace>/<name> --version <new-version> [--public]
+```
+
+### Step 6 — Revert to a previous version if needed
+
+```bash
+# See all available versions
+python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<name>
+
+# Reinstall the preferred older version
+python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --version <old-version> --tool claude
+```
+
 ## How to Use
 
 When the user asks to scan, save, share, install, list, backup, or search for skills:
@@ -102,6 +151,9 @@ Common user requests and which command to use:
 - "install a skill" -> `install @ns/name --tool <name>` (or `--skills-dir <path>`)
 - "back up my skill" -> `backup <path>`
 - "restore my skill" -> `restore <name> --tool <name>` (or `--skills-dir <path>`)
+- "improve this skill" / "make this skill better" / "update the skill instructions" -> edit + save workflow (see "Improving & Iterating on Skills")
+- "push a new version" / "publish my changes" -> `save <path> --version <next>`
+- "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `info @ns/name` to list versions, then `install @ns/name --version <old>`
 
 ## Configuration
 
