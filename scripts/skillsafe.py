@@ -2034,7 +2034,7 @@ def cmd_share(args: argparse.Namespace) -> None:
 
 def cmd_install(args: argparse.Namespace) -> None:
     """Install a skill from the registry."""
-    cfg = require_config()
+    cfg = load_config()  # May return empty dict if not authenticated
 
     # Detect share link references (shr_ prefix or URL containing /share/shr_)
     skill_ref = args.skill
@@ -2247,8 +2247,8 @@ def _submit_verification(
         verdict_result = client.verify(namespace, name, version, consumer_report)
         return verdict_result.get("verdict", "unknown"), verdict_result.get("details", {})
     except SkillSafeError as e:
-        if e.status == 403:
-            print(f"  Verification skipped: {e.message}")
+        if e.status in (401, 403):
+            print("  Verification skipped (sign in with 'skillsafe auth' to enable dual-side verification).")
             return "skipped", {}
         else:
             print(f"  Warning: Verification failed due to error: {e.message}", file=sys.stderr)
