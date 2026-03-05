@@ -22,6 +22,10 @@ Usage:
 
 Also importable as a module:
     from skillsafe import Scanner, SkillSafeClient
+
+References / Thanks:
+    https://github.com/kriskimmerle/skillsafe — rule taxonomy and detection patterns
+    OWASP Agentic AI Threat Taxonomy
 """
 
 from __future__ import annotations
@@ -93,7 +97,7 @@ def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
 # ---------------------------------------------------------------------------
 
 VERSION = "0.1.1"
-RULESET_VERSION = "2025.01.01"
+RULESET_VERSION = "2026.03.01"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
 
@@ -117,6 +121,14 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# Binary file extensions that should not be bundled in skills
+BINARY_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".elf",
+    ".o", ".a", ".ko", ".sys", ".drv",
+    ".deb", ".rpm", ".msi", ".pkg",
+    ".pyc", ".pyo", ".pyd",
+}
 
 # Module-level update check state — set by _request(), read by _print_update_notice()
 _update_available: Optional[str] = None  # latest version if newer than VERSION, else None
@@ -306,11 +318,14 @@ class Scanner:
     """
     Security scanner for skill directories.
 
-    Performs four scan passes:
+    Performs seven scan passes:
       1. Python static analysis (AST-based)
       2. JavaScript / TypeScript static analysis (regex-based)
       3. Secret detection (regex on all text files)
       4. Prompt injection detection (regex on .md files)
+      5. Shell / general threat patterns (exfil, persistence, reverse shell, recon, …)
+      6. Binary file detection (bundled executables/libraries)
+      7. base64 deep-scan (decode blobs and re-check for dangerous payloads)
     """
 
     # -- Dangerous Python function patterns (AST-based) ---------------------
@@ -381,6 +396,90 @@ class Scanner:
 
     _INJECTION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
 
+    # -- Shell / general threat patterns (SS03-SS22) ------------------------
+    # Applied to all text files. Each tuple: (pattern, rule_id, severity, message)
+
+    _SHELL_THREAT_PATTERNS: List[Tuple[str, str, str, str]] = [
+        # SS03 – Data exfiltration to known collection services
+        (r"(?:curl|wget).*(?:ngrok\.io|requestbin\.com|webhook\.site|pipedream\.net|canarytokens|burpcollaborator)", "shell_exfil_service", "high", "Data exfiltration to known collection service (SS03)"),
+
+        # SS04 – Agent memory / instruction file poisoning
+        (r">\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md|\.cursorrules)", "agent_memory_write", "high", "Writing to agent memory/instruction file (SS04)"),
+        (r"echo\s+.*>>?\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md)", "agent_memory_inject", "high", "Injecting content into agent memory file (SS04)"),
+
+        # SS07 – Privilege escalation
+        (r"\bsudo\s+(?:su|bash|sh|-s|-i)\b", "priv_escalation_sudo", "high", "Privilege escalation via sudo shell (SS07)"),
+        (r"\bseteuid\s*\(\s*0\s*\)|\bsetuid\s*\(\s*0\s*\)", "priv_setuid_root", "critical", "Setting UID/EUID to root (SS07)"),
+
+        # SS08 – Persistence mechanisms
+        (r"crontab\s+-[le]|@reboot|/etc/cron\b", "persistence_cron", "high", "Persistence via cron (SS08)"),
+        (r"~/Library/LaunchAgents|/Library/LaunchAgents|~/Library/LaunchDaemons|/Library/LaunchDaemons", "persistence_launchd", "high", "Persistence via macOS LaunchAgent/LaunchDaemon (SS08)"),
+        (r"systemctl\s+enable\s+|/etc/systemd/system/.*\.service", "persistence_systemd", "high", "Persistence via systemd service (SS08)"),
+        (r"echo\s+.*>>?\s*~/?\.(bash_profile|bashrc|zshrc|profile|bash_login|zprofile)", "persistence_shell_profile", "medium", "Modifying shell profile for persistence (SS08)"),
+
+        # SS09 – Reverse shell
+        (r"/dev/tcp/\d|/dev/udp/\d", "reverse_shell_devtcp", "critical", "Reverse shell via /dev/tcp or /dev/udp (SS09)"),
+        (r"(?:nc|ncat|netcat)\s+[^;|]*-[eEcClL]|-[eEcClL]\s+[^;|]*(?:nc|ncat|netcat)\b", "reverse_shell_netcat", "critical", "Reverse shell via netcat -e/-l (SS09)"),
+        (r"socat\s+[^;|]*(?:EXEC|exec).*TCP", "reverse_shell_socat", "critical", "Reverse shell via socat (SS09)"),
+        (r"bash\s+-[iI]\s*>&?\s*/dev/tcp", "reverse_shell_bash", "critical", "Bash reverse shell (SS09)"),
+
+        # SS11 – ClickFix social engineering
+        (r"(?:open|launch)\s+(?:a\s+)?terminal\s+and\s+(?:paste|run|type|execute)", "clickfix_terminal", "high", "ClickFix: instruction to open terminal and run command (SS11)"),
+        (r"(?:copy|paste)\s+(?:this\s+)?(?:command|code|script)\s+(?:into|to)\s+(?:your\s+)?(?:terminal|console|command\s+prompt)", "clickfix_copy_paste", "high", "ClickFix: copy-paste terminal instruction (SS11)"),
+        (r"press\s+(?:win|windows|cmd)\s*\+\s*r\s+and", "clickfix_run_dialog", "high", "ClickFix: Windows Run dialog social engineering (SS11)"),
+
+        # SS13 – Dangerous file / disk operations
+        (r"\brm\s+(?:-[rRfv]+\s+)*(?:/[^/\s]|~/|~\s|/\s|\$HOME/?[\s;|])", "dangerous_rm_root", "critical", "Dangerous rm targeting root or home directory (SS13)"),
+        (r"\bdd\s+.*\bof=/dev/(?:sd[a-z]|hd[a-z]|nvme\d|xvd[a-z]|vd[a-z])", "dangerous_dd_device", "critical", "dd writing to block device — data destruction (SS13)"),
+
+        # SS14 – Reconnaissance
+        (r"\bnmap\b|\bmasscan\b|\barp-scan\b|\bzmap\b|\bunicornscan\b", "recon_portscan", "high", "Network port scanning tool detected (SS14)"),
+        (r"169\.254\.169\.254", "cloud_metadata_imds", "critical", "AWS/Azure/GCP instance metadata service endpoint (SS14)"),
+        (r"metadata\.google\.internal", "cloud_metadata_gcp", "critical", "GCP metadata server access (SS14)"),
+        (r"100\.100\.100\.200", "cloud_metadata_alibaba", "high", "Alibaba Cloud metadata endpoint (SS14)"),
+
+        # SS17 – Credential file reading
+        (r"(?:cat|read|open)\s+.*~?(?:/home/[^/]+)?/\.aws/credentials", "cred_read_aws", "critical", "Reading AWS credentials file (SS17)"),
+        (r"(?:cat|read|open)\s+.*~?(?:/home/[^/]+)?/\.docker/config\.json", "cred_read_docker", "critical", "Reading Docker config (may contain registry tokens) (SS17)"),
+        (r"find\s+.*(?:\.ssh|\.aws|\.gnupg|\.config/gcloud)\s", "cred_find_dirs", "high", "Searching credential directories (SS17)"),
+
+        # SS18 – Cryptocurrency targeting
+        (r"(?:seed\s+phrase|mnemonic\s+phrase|secret\s+recovery\s+phrase|wallet\s+recovery\s+phrase)", "crypto_seed_phrase", "critical", "Cryptocurrency seed/recovery phrase reference (SS18)"),
+        (r"(?:MetaMask|Phantom|Exodus|Electrum|Wasabi|Trezor|Ledger)\s+(?:wallet|keystore|password|seed|mnemon)", "crypto_wallet_software", "high", "Cryptocurrency wallet credential reference (SS18)"),
+        (r"~/\.(?:ethereum|bitcoin|litecoin|monero|dogecoin)|~/Library/(?:Ethereum|Bitcoin)", "crypto_wallet_dir", "high", "Cryptocurrency wallet directory access (SS18)"),
+
+        # SS19/SS20 – Path traversal & sensitive file reads
+        (r"(?:\.\.\/){2,}(?:etc|usr|root|home|sys|proc|var)", "path_traversal_sys", "high", "Directory traversal to system path (SS19)"),
+        (r"(?:cat|head|tail)\s+/etc/(?:passwd|shadow|sudoers|hosts)", "sensitive_sys_read", "critical", "Reading sensitive system file (SS20)"),
+        (r"\.git/hooks/(?:pre-commit|post-commit|post-merge|pre-push|post-receive)\b", "git_hook_persist", "medium", "Git hook file reference — possible persistence (SS20)"),
+
+        # SS05 – base64 decode-then-execute (pattern-level; deep-scan handled in pass 7)
+        (r"\|\s*base64\s+(?:-d|--decode)\s*\|\s*(?:bash|sh|python3?|perl|ruby)\b", "b64_decode_exec", "critical", "base64 decoded content piped to shell (SS05)"),
+        (r"base64\s+(?:-d|--decode)\s+[a-zA-Z0-9._-]+\s*\|\s*(?:bash|sh)\b", "b64_file_exec", "critical", "base64 decoded file executed as shell (SS05)"),
+    ]
+
+    _SHELL_THREAT_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Unicode obfuscation patterns (SS10) --------------------------------
+    # Note: uses non-raw strings so \uXXXX escapes are interpreted by Python.
+
+    _OBFUSCATION_PATTERNS: List[Tuple[str, str, str, str]] = [
+        ("\u200b|\u200c|\u200d|\u2060|\ufeff", "unicode_zero_width", "high", "Zero-width Unicode character detected — possible obfuscation (SS10)"),
+        ("[а-яА-ЯёЁ][a-zA-Z]|[a-zA-Z][а-яА-ЯёЁ]", "unicode_cyrillic_mix", "high", "Cyrillic characters mixed with Latin — possible IDN homograph attack (SS10)"),
+    ]
+
+    _OBFUSCATION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Severity penalties for scoring -------------------------------------
+
+    _SEVERITY_PENALTIES: Dict[str, int] = {
+        "critical": 25,
+        "high": 15,
+        "medium": 5,
+        "low": 2,
+        "info": 0,
+    }
+
     # -- Initialisation -----------------------------------------------------
 
     def __init__(self) -> None:
@@ -396,6 +495,14 @@ class Scanner:
         if Scanner._INJECTION_COMPILED is None:
             Scanner._INJECTION_COMPILED = [
                 (re.compile(p, re.IGNORECASE), rid, sev, msg) for p, rid, sev, msg in Scanner._INJECTION_PATTERNS
+            ]
+        if Scanner._SHELL_THREAT_COMPILED is None:
+            Scanner._SHELL_THREAT_COMPILED = [
+                (re.compile(p, re.IGNORECASE), rid, sev, msg) for p, rid, sev, msg in Scanner._SHELL_THREAT_PATTERNS
+            ]
+        if Scanner._OBFUSCATION_COMPILED is None:
+            Scanner._OBFUSCATION_COMPILED = [
+                (re.compile(p, re.UNICODE), rid, sev, msg) for p, rid, sev, msg in Scanner._OBFUSCATION_PATTERNS
             ]
 
     # -- Public API ---------------------------------------------------------
@@ -449,6 +556,30 @@ class Scanner:
                 injection_findings.extend(self._scan_prompt_injection(fpath, path))
         all_findings.extend(injection_findings)
 
+        # Pass 5: Shell / general threat patterns (all text files)
+        shell_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                shell_findings.extend(self._scan_shell_threats(fpath, path))
+        all_findings.extend(shell_findings)
+
+        # Pass 6: Binary file detection
+        all_findings.extend(self._scan_binary_files(files, path))
+
+        # Pass 7: base64 deep-scan (text files)
+        b64_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                b64_findings.extend(self._scan_base64_deep(fpath, path))
+        all_findings.extend(b64_findings)
+
+        # Pass 8: Unicode obfuscation (all text files)
+        obfuscation_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                obfuscation_findings.extend(self._scan_obfuscation(fpath, path))
+        all_findings.extend(obfuscation_findings)
+
         # Build summary (deduplicated list for server comparison)
         findings_summary = [
             {"rule_id": f["rule_id"], "severity": f["severity"], "file": f["file"], "line": f["line"], "message": f["message"]}
@@ -456,6 +587,7 @@ class Scanner:
         ]
 
         is_clean = len(all_findings) == 0
+        score, grade = self._calculate_score(all_findings)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         report: Dict[str, Any] = {
@@ -468,6 +600,8 @@ class Scanner:
             "clean": is_clean,
             "findings_count": len(all_findings),
             "findings_summary": findings_summary,
+            "score": score,
+            "grade": grade,
             "timestamp": now,
         }
         if tree_hash:
@@ -668,6 +802,141 @@ class Scanner:
                     })
 
         return findings
+
+    # -- Pass 5: Shell / general threat patterns ----------------------------
+
+    def _scan_shell_threats(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._SHELL_THREAT_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._SHELL_THREAT_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": line.strip()[:120],
+                    })
+
+        return findings
+
+    # -- Pass 6: Binary file detection --------------------------------------
+
+    def _scan_binary_files(self, files: List[Path], root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for fpath in files:
+            if fpath.suffix.lower() in BINARY_EXTENSIONS:
+                rel = str(fpath.relative_to(root))
+                findings.append({
+                    "rule_id": "binary_file_bundled",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": f"Binary file bundled in skill: {fpath.suffix} (SS16)",
+                    "context": fpath.name,
+                })
+        return findings
+
+    # -- Pass 7: base64 deep-scan -------------------------------------------
+
+    def _scan_base64_deep(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        """Decode suspicious base64 blobs and re-scan for dangerous payloads (SS05)."""
+        import base64 as _base64
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return findings
+
+        # Match blobs that look like base64 (>=40 chars, valid alphabet)
+        b64_re = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+        _danger = re.compile(
+            r'curl[^;|]*\|\s*(?:bash|sh)\b'
+            r'|/dev/tcp/'
+            r'|\brm\s+-[rRf]+\s+/'
+            r'|wget[^;|]*\|\s*(?:bash|sh)\b'
+            r'|python\s+-c\s+["\']import\s+socket'
+            r'|nc\s+.*-[eElL]',
+            re.IGNORECASE,
+        )
+
+        for lineno_0, line in enumerate(content.splitlines()):
+            for m in b64_re.finditer(line):
+                blob = m.group(0)
+                try:
+                    # Pad to multiple of 4 before decoding
+                    decoded = _base64.b64decode(blob + "==").decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if _danger.search(decoded):
+                    findings.append({
+                        "rule_id": "b64_encoded_payload",
+                        "severity": "critical",
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": "base64-encoded dangerous payload detected (SS05)",
+                        "context": blob[:40] + "...",
+                    })
+                    break  # One finding per line
+
+        return findings
+
+    # -- Pass 8: Unicode obfuscation ----------------------------------------
+
+    def _scan_obfuscation(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._OBFUSCATION_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._OBFUSCATION_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": repr(line.strip()[:80]),
+                    })
+
+        return findings
+
+    # -- Scoring ------------------------------------------------------------
+
+    def _calculate_score(self, findings: List[Dict[str, Any]]) -> Tuple[int, str]:
+        """Return (score 0-100, letter grade A+/A/B/C/D/F)."""
+        penalty = sum(self._SEVERITY_PENALTIES.get(f.get("severity", "info"), 0) for f in findings)
+        score = max(0, 100 - penalty)
+        if score == 100:
+            grade = "A+"
+        elif score >= 90:
+            grade = "A"
+        elif score >= 80:
+            grade = "B"
+        elif score >= 70:
+            grade = "C"
+        elif score >= 50:
+            grade = "D"
+        else:
+            grade = "F"
+        return score, grade
 
 
 def _redact_line(line: str) -> str:
@@ -1769,6 +2038,20 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Apply --ignore filter
+    ignore_rules: set = set()
+    if getattr(args, "ignore", None):
+        ignore_rules = {r.strip() for r in args.ignore.split(",")}
+    if ignore_rules:
+        report["findings_summary"] = [
+            f for f in report["findings_summary"] if f["rule_id"] not in ignore_rules
+        ]
+        report["findings_count"] = len(report["findings_summary"])
+        report["clean"] = len(report["findings_summary"]) == 0
+        score, grade = scanner._calculate_score(report["findings_summary"])
+        report["score"] = score
+        report["grade"] = grade
+
     _print_scan_results(report)
 
     # Optionally write report to file
@@ -1778,6 +2061,12 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
             json.dump(report, f, indent=2)
             f.write("\n")
         print(f"\nReport written to {out_path}")
+
+    # --check: exit 1 if any HIGH or CRITICAL findings remain
+    if getattr(args, "check", False):
+        _high = {"critical", "high"}
+        if any(f.get("severity") in _high for f in report.get("findings_summary", [])):
+            sys.exit(1)
 
     return report
 
@@ -2261,9 +2550,17 @@ def _handle_verdict(verdict: str, details: Dict[str, Any]) -> bool:
     if verdict == "verified":
         print(green("  Verified: publisher and consumer scans match."))
     elif verdict == "divergent":
-        print(yellow("  WARNING: Scan reports diverge."))
+        if details.get("ruleset_upgrade_divergence"):
+            print(yellow("  WARNING: Scan reports diverge due to scanner ruleset upgrade."))
+            print(f"    Publisher ruleset: {details.get('publisher_ruleset_version', '?')}")
+            print(f"    Your ruleset:      {details.get('consumer_ruleset_version', '?')}")
+            print("    The publisher's scan used an older ruleset that may have missed findings.")
+            print("    Recommendation: ask the publisher to re-scan and re-share with the current scanner.")
+        else:
+            print(yellow("  WARNING: Scan reports diverge."))
         for key, val in details.items():
-            print(f"    {key}: {val}")
+            if key not in ("ruleset_upgrade_divergence", "publisher_ruleset_version", "consumer_ruleset_version"):
+                print(f"    {key}: {val}")
         if sys.stdin.isatty():
             try:
                 answer = input("  Install anyway? [y/N] ").strip().lower()
@@ -2756,10 +3053,28 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
     return None
 
 
+def _grade_color(grade: str) -> str:
+    """Return a colored grade string."""
+    if grade in ("A+", "A"):
+        return green(grade)
+    if grade == "B":
+        return cyan(grade)
+    if grade == "C":
+        return yellow(grade)
+    return red(grade)
+
+
 def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
     """Pretty-print scan results."""
     prefix = " " * indent
     findings = report.get("findings_summary", [])
+    score = report.get("score")
+    grade = report.get("grade")
+
+    if score is not None and grade is not None:
+        grade_str = _grade_color(grade)
+        score_label = green(str(score)) if score >= 80 else (yellow(str(score)) if score >= 60 else red(str(score)))
+        print(f"{prefix}Score: {score_label}/100  Grade: {grade_str}\n")
 
     if report.get("clean", True) and not findings:
         print(f"{prefix}{green('No security issues found.')}")
@@ -2880,6 +3195,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_scan = subparsers.add_parser("scan", help="Scan a skill directory for security issues")
     p_scan.add_argument("path", help="Path to the skill directory")
     p_scan.add_argument("-o", "--output", help="Write JSON report to file")
+    p_scan.add_argument("--check", action="store_true", help="Exit with code 1 if any HIGH or CRITICAL findings exist (CI mode)")
+    p_scan.add_argument("--ignore", metavar="RULES", help="Comma-separated rule IDs to suppress (e.g. git_hook_persist,unpinned_npm)")
 
     # -- save ---------------------------------------------------------------
     p_save = subparsers.add_parser("save", help="Save a skill to the registry (private by default)")
