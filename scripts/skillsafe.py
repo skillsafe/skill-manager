@@ -318,7 +318,7 @@ class Scanner:
     """
     Security scanner for skill directories.
 
-    Performs seven scan passes:
+    Performs eight scan passes:
       1. Python static analysis (AST-based)
       2. JavaScript / TypeScript static analysis (regex-based)
       3. Secret detection (regex on all text files)
@@ -326,6 +326,7 @@ class Scanner:
       5. Shell / general threat patterns (exfil, persistence, reverse shell, recon, …)
       6. Binary file detection (bundled executables/libraries)
       7. base64 deep-scan (decode blobs and re-check for dangerous payloads)
+      8. Unicode obfuscation detection (zero-width chars, Cyrillic/Latin homographs)
     """
 
     # -- Dangerous Python function patterns (AST-based) ---------------------
@@ -395,6 +396,7 @@ class Scanner:
     ]
 
     _INJECTION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+    _INJECTION_EXTENSIONS: frozenset = frozenset({".md", ".txt", ".yaml", ".yml", ".rst"})
 
     # -- Shell / general threat patterns (SS03-SS22) ------------------------
     # Applied to all text files. Each tuple: (pattern, rule_id, severity, message)
@@ -405,7 +407,7 @@ class Scanner:
 
         # SS04 – Agent memory / instruction file poisoning
         (r">\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md|\.cursorrules)", "agent_memory_write", "high", "Writing to agent memory/instruction file (SS04)"),
-        (r"echo\s+.*>>?\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md)", "agent_memory_inject", "high", "Injecting content into agent memory file (SS04)"),
+        (r"echo\s+.*>>?\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md|\.cursorrules)", "agent_memory_inject", "high", "Injecting content into agent memory file (SS04)"),
 
         # SS07 – Privilege escalation
         (r"\bsudo\s+(?:su|bash|sh|-s|-i)\b", "priv_escalation_sudo", "high", "Privilege escalation via sudo shell (SS07)"),
@@ -470,6 +472,10 @@ class Scanner:
 
     _OBFUSCATION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
 
+    # -- base64 deep-scan compiled patterns ---------------------------------
+    _B64_RE: Optional[re.Pattern] = None
+    _DANGER_RE: Optional[re.Pattern] = None
+
     # -- Severity penalties for scoring -------------------------------------
 
     _SEVERITY_PENALTIES: Dict[str, int] = {
@@ -504,6 +510,17 @@ class Scanner:
             Scanner._OBFUSCATION_COMPILED = [
                 (re.compile(p, re.UNICODE), rid, sev, msg) for p, rid, sev, msg in Scanner._OBFUSCATION_PATTERNS
             ]
+        if Scanner._B64_RE is None:
+            Scanner._B64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+            Scanner._DANGER_RE = re.compile(
+                r'curl[^;|]*\|\s*(?:bash|sh)\b'
+                r'|/dev/tcp/'
+                r'|\brm\s+-[rRf]+\s+/'
+                r'|wget[^;|]*\|\s*(?:bash|sh)\b'
+                r'|python\s+-c\s+["\']import\s+socket'
+                r'|nc\s+.*-[eElL]',
+                re.IGNORECASE,
+            )
 
     # -- Public API ---------------------------------------------------------
 
@@ -549,10 +566,9 @@ class Scanner:
         all_findings.extend(secret_findings)
 
         # Pass 4: Prompt injection (text-like files)
-        _injection_extensions = {".md", ".txt", ".yaml", ".yml", ".rst"}
         injection_findings = []
         for fpath in files:
-            if fpath.suffix.lower() in _injection_extensions:
+            if fpath.suffix.lower() in Scanner._INJECTION_EXTENSIONS:
                 injection_findings.extend(self._scan_prompt_injection(fpath, path))
         all_findings.extend(injection_findings)
 
@@ -860,26 +876,15 @@ class Scanner:
             return findings
 
         # Match blobs that look like base64 (>=40 chars, valid alphabet)
-        b64_re = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
-        _danger = re.compile(
-            r'curl[^;|]*\|\s*(?:bash|sh)\b'
-            r'|/dev/tcp/'
-            r'|\brm\s+-[rRf]+\s+/'
-            r'|wget[^;|]*\|\s*(?:bash|sh)\b'
-            r'|python\s+-c\s+["\']import\s+socket'
-            r'|nc\s+.*-[eElL]',
-            re.IGNORECASE,
-        )
-
         for lineno_0, line in enumerate(content.splitlines()):
-            for m in b64_re.finditer(line):
+            for m in Scanner._B64_RE.finditer(line):
                 blob = m.group(0)
                 try:
                     # Pad to multiple of 4 before decoding
                     decoded = _base64.b64decode(blob + "==").decode("utf-8", errors="ignore")
                 except Exception:
                     continue
-                if _danger.search(decoded):
+                if Scanner._DANGER_RE.search(decoded):
                     findings.append({
                         "rule_id": "b64_encoded_payload",
                         "severity": "critical",
