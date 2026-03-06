@@ -16,6 +16,7 @@ Usage:
     python skillsafe.py search <query> [--category <c>] [--sort <s>]
     python skillsafe.py info <@namespace/skill>
     python skillsafe.py list
+    python skillsafe.py update
     python skillsafe.py whoami
     python skillsafe.py backup <path> [--name <name>] [--version <ver>]
     python skillsafe.py restore <@namespace/name> [--skills-dir <dir>] [--tool <name>] [-o <dir>]
@@ -179,8 +180,7 @@ def _print_update_notice() -> None:
     """Print an update notice if a newer CLI version was detected."""
     if _update_available:
         print(f"\n{yellow(f'Update available: v{VERSION} → v{_update_available}')}")
-        print(f"  Run: {bold('curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o scripts/skillsafe.py')}")
-        print(f"  Or:  {bold('python3 scripts/skillsafe.py self-update')}\n")
+        print(f"  Run: {bold('python3 scripts/skillsafe.py update')}\n")
 
 
 def _mask_api_key(key: str) -> str:
@@ -1897,6 +1897,43 @@ def cmd_whoami(args: argparse.Namespace) -> None:
     print()
 
 
+def cmd_self_update(args: argparse.Namespace) -> None:
+    """Download the latest skillsafe.py from skillsafe.ai and replace this script."""
+    url = "https://skillsafe.ai/scripts/skillsafe.py"
+    script_path = Path(__file__).resolve()
+
+    print(f"  Current version: {bold(f'v{VERSION}')}")
+    print(f"  Checking {url} ...")
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"skillsafe-cli/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            new_src = resp.read()
+    except Exception as e:
+        print(f"\n{red('Error:')} Could not download update: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract version from downloaded script
+    m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', new_src, re.MULTILINE)
+    new_version = m.group(1).decode() if m else "unknown"
+
+    if new_version != "unknown" and _parse_semver(new_version) <= _parse_semver(VERSION):
+        print(f"\n{green('Already up to date.')} (v{VERSION})")
+        return
+
+    # Write atomically via temp file
+    tmp = script_path.with_suffix(".py.tmp")
+    try:
+        tmp.write_bytes(new_src)
+        tmp.replace(script_path)
+    except OSError as e:
+        print(f"\n{red('Error:')} Could not write update: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n{green(f'Updated: v{VERSION} → v{new_version}')}")
+    print(f"  {script_path}")
+
+
 def cmd_auth(args: argparse.Namespace) -> None:
     """Authenticate via browser login."""
     api_base: str = getattr(args, "api_base", DEFAULT_API_BASE)
@@ -3336,6 +3373,7 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe backup ~/.claude/skills/my-skill
               skillsafe restore my-skill --tool claude --location global
               skillsafe restore my-skill --tool windsurf --location global
+              skillsafe update                             # update CLI to latest version
               skillsafe whoami                             # check auth status
         """),
     )
@@ -3409,6 +3447,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     # -- whoami -------------------------------------------------------------
     p_whoami = subparsers.add_parser("whoami", help="Show current authentication status and account info")
 
+    # -- self-update --------------------------------------------------------
+    p_update = subparsers.add_parser("update", help="Update skillsafe CLI to the latest version from skillsafe.ai")
+    p_update2 = subparsers.add_parser("self-update", help="Alias for update")
+
     args = parser.parse_args(argv)
 
     # Ensure api_base is set in the namespace (subcommand may not define it)
@@ -3445,6 +3487,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_demo(args)
     elif args.command == "whoami":
         cmd_whoami(args)
+    elif args.command in ("update", "self-update"):
+        cmd_self_update(args)
     else:
         parser.print_help()
         sys.exit(1)
