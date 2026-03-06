@@ -970,10 +970,17 @@ class TestConfig(unittest.TestCase):
 
 class TestResolveSkillsDir(unittest.TestCase):
 
-    def test_none_when_no_flags(self):
+    def test_no_flags_returns_project_claude_skills(self):
+        """Default (no flags) installs to .claude/skills/ in cwd."""
         args = _mock_args(skills_dir=None, tool=None)
         result = skillsafe._resolve_skills_dir(args)
-        self.assertIsNone(result)
+        self.assertEqual(result, Path.cwd() / ".claude" / "skills")
+
+    def test_tool_project_returns_cwd_claude_skills(self):
+        """--tool project installs to .claude/skills/ in cwd."""
+        args = _mock_args(tool="project")
+        result = skillsafe._resolve_skills_dir(args)
+        self.assertEqual(result, Path.cwd() / ".claude" / "skills")
 
     def test_skills_dir_flag(self):
         args = _mock_args(skills_dir="/tmp/custom/skills")
@@ -983,14 +990,32 @@ class TestResolveSkillsDir(unittest.TestCase):
     def test_tool_flag_claude(self):
         args = _mock_args(tool="claude")
         result = skillsafe._resolve_skills_dir(args)
-        expected = Path.home() / ".claude" / "skills"
-        self.assertEqual(result, expected)
+        self.assertEqual(result, Path.home() / ".claude" / "skills")
 
     def test_tool_flag_cursor(self):
         args = _mock_args(tool="cursor")
         result = skillsafe._resolve_skills_dir(args)
-        expected = Path.home() / ".cursor" / "skills"
-        self.assertEqual(result, expected)
+        self.assertEqual(result, Path.home() / ".cursor" / "skills")
+
+    def test_tool_flag_windsurf(self):
+        args = _mock_args(tool="windsurf")
+        result = skillsafe._resolve_skills_dir(args)
+        self.assertEqual(result, Path.home() / ".windsurf" / "skills")
+
+    def test_tool_flag_codex(self):
+        args = _mock_args(tool="codex")
+        result = skillsafe._resolve_skills_dir(args)
+        self.assertEqual(result, Path.home() / ".agents" / "skills")
+
+    def test_tool_flag_gemini(self):
+        args = _mock_args(tool="gemini")
+        result = skillsafe._resolve_skills_dir(args)
+        self.assertEqual(result, Path.home() / ".gemini" / "skills")
+
+    def test_tool_flag_opencode(self):
+        args = _mock_args(tool="opencode")
+        result = skillsafe._resolve_skills_dir(args)
+        self.assertEqual(result, Path.home() / ".config" / "opencode" / "skills")
 
     def test_unknown_tool_exits_with_error(self):
         """Audit #6 fix: unknown tool prints error and exits with code 1."""
@@ -1622,6 +1647,52 @@ class TestDetectTool(unittest.TestCase):
         with mock.patch("skillsafe.__file__", fake_path):
             result = skillsafe._detect_tool()
             self.assertEqual(result, "claude")
+
+    def test_detects_codex(self):
+        """Codex uses .agents/skills/ — aliased back to 'codex'."""
+        fake_path = str(Path.home() / ".agents" / "skills" / "skillsafe" / "scripts" / "skillsafe.py")
+        with mock.patch("skillsafe.__file__", fake_path):
+            result = skillsafe._detect_tool()
+            self.assertEqual(result, "codex")
+
+
+# ===========================================================================
+# 21a. TestMaybeHintGlobalInstall
+# ===========================================================================
+
+class TestMaybeHintGlobalInstall(unittest.TestCase):
+
+    def test_prints_hint_when_no_tool_or_skills_dir(self):
+        """Hint is printed when neither --tool nor --skills-dir was given."""
+        args = _mock_args(tool=None, skills_dir=None)
+        with mock.patch("builtins.print") as mock_print:
+            skillsafe._maybe_hint_global_install(args, "alice", "my-skill")
+        calls = " ".join(str(c) for c in mock_print.call_args_list)
+        self.assertIn("--tool", calls)
+        self.assertIn("@alice/my-skill", calls)
+
+    def test_suppressed_when_tool_given(self):
+        """No hint when --tool was explicitly passed."""
+        args = _mock_args(tool="claude", skills_dir=None)
+        with mock.patch("builtins.print") as mock_print:
+            skillsafe._maybe_hint_global_install(args, "alice", "my-skill")
+        mock_print.assert_not_called()
+
+    def test_suppressed_when_skills_dir_given(self):
+        """No hint when --skills-dir was explicitly passed."""
+        args = _mock_args(tool=None, skills_dir="/tmp/custom")
+        with mock.patch("builtins.print") as mock_print:
+            skillsafe._maybe_hint_global_install(args, "alice", "my-skill")
+        mock_print.assert_not_called()
+
+    def test_hint_includes_all_tools(self):
+        """Hint lists every key in TOOL_SKILLS_DIRS."""
+        args = _mock_args(tool=None, skills_dir=None)
+        with mock.patch("builtins.print") as mock_print:
+            skillsafe._maybe_hint_global_install(args, "alice", "my-skill")
+        calls = " ".join(str(c) for c in mock_print.call_args_list)
+        for key in skillsafe.TOOL_SKILLS_DIRS:
+            self.assertIn(f"--tool {key}", calls)
 
 
 # ===========================================================================

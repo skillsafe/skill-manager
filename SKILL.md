@@ -18,7 +18,7 @@ mkdir -p <skill-dir>/scripts && curl -fsSL https://skillsafe.ai/scripts/skillsaf
 
 This is only needed for first-time installation from URL. If installed via `skillsafe install`, the script is already included.
 
-**Installing into the current tool's skills directory:** Use `--tool <name>` for known tools (`claude`, `cursor`, `windsurf`, `openclaw`). If you are running inside a different tool not listed here, use `--skills-dir <path>` with the tool's skills directory path instead — do not attempt to write files directly outside the tool's workspace.
+**Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 
 ## Available Commands
 
@@ -56,7 +56,7 @@ Creates a share link for a specific version. By default the link is private (onl
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
-Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. Use `--tool <name>` to install into a known tool's skills directory (`--tool claude`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
+Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. By default (no flags), installs into the **current project's `.claude/skills/`** directory so the agent can use it immediately without restarting. Use `--tool project` to make this explicit. Use `--tool <name>` to install into a known tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
 
 After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash. The installer also injects `improvable: true` and `registry` fields into the skill's SKILL.md frontmatter if not already present.
 
@@ -72,6 +72,29 @@ python3 <skill-dir>/scripts/skillsafe.py yank @<namespace>/<skill-name> --versio
 ```
 Marks a version as yanked — it remains visible in `info` but cannot be downloaded. Use when a published version has a bug or security issue. Other versions are unaffected.
 
+### Demo — Upload a chat recording
+```bash
+python3 <skill-dir>/scripts/skillsafe.py demo <demo-json-file> @<ns>/<name> --version <ver> [--title "Title"]
+```
+Upload a recorded chat session showing the skill in action. The demo JSON must follow the `skillsafe-demo/1` schema:
+```json
+{
+  "schema": "skillsafe-demo/1",
+  "title": "Example: reviewing a pull request",
+  "messages": [
+    {"role": "user", "content": "Review PR #42"},
+    {
+      "role": "assistant",
+      "content": "I'll review it now.",
+      "tool_uses": [
+        {"tool": "Bash", "input": "gh pr view 42", "output": "Title: Add auth..."}
+      ]
+    }
+  ]
+}
+```
+Fields: `schema` (required), `title` (required, max 200 chars), `messages` array with `role`/`content`/`tool_uses`. Limits: max 5 MB, max 1000 messages. The `--title` flag overrides the title in the JSON.
+
 ### Info — Get skill details
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
@@ -81,7 +104,7 @@ python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py list
 ```
-Shows skills from multiple locations: known tool directories (`~/.claude/skills/`, `~/.cursor/skills/`, `~/.windsurf/skills/`), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
+Shows skills from multiple locations: known tool directories (`~/.claude/skills/`, `~/.cursor/skills/`, `~/.windsurf/skills/`, `~/.agents/skills/`, `~/.gemini/skills/`, `~/.config/opencode/skills/`), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
 
 ## Improving & Iterating on Skills
 
@@ -90,10 +113,10 @@ Use this workflow when the user wants to edit an existing skill, publish a new v
 ### Step 1 — Install locally for editing
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --tool claude
+python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name>
 ```
 
-After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
+This installs into `.claude/skills/` in the current project by default. After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
 
 ### Step 2 — Edit the skill
 
@@ -231,15 +254,15 @@ Common user requests and which command to use:
 - "scan this for security issues" -> `scan <path>`
 - "save my skill" / "upload my skill" -> `save <path>` (auto-versions) or `save <path> --version <ver>`
 - "share my skill" / "publish my skill" -> `share @ns/name --version <ver>` (add `--public` for search visibility)
-- "install a skill" -> `install @ns/name --tool <name>` (or `--skills-dir <path>`)
+- "install a skill" -> `install @ns/name` (project default) or `install @ns/name --tool <name>` for global install
 - "improve this skill" / "make this skill better" / "update the skill instructions" -> edit + save workflow (see "Improving & Iterating on Skills")
 - "push a new version" / "publish my changes" -> `save <path> --changelog "what changed"`
-- "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old> --tool claude`
+- "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old>` (project) or `install @ns/name --version <old> --tool claude` (global)
 - "yank this version" / "block this version" / "this version is broken" -> `yank @ns/name --version <ver> --reason "..."`
 
 ## Configuration
 
-Credentials are stored in `~/.skillsafe/config.json`. Installed skills live in `~/.skillsafe/skills/` by default, or in any tool's skills directory when using `--tool <name>` (claude, cursor, windsurf) or `--skills-dir <path>`.
+Credentials are stored in `~/.skillsafe/config.json`. By default, `install` places skills in `.claude/skills/` in the current project directory. Use `--tool <name>` (`claude` → `~/.claude/skills/`, `cursor` → `~/.cursor/skills/`, `windsurf` → `~/.windsurf/skills/`, `codex` → `~/.agents/skills/`, `gemini` → `~/.gemini/skills/`, `opencode` → `~/.config/opencode/skills/`, `openclaw`) for global install, or `--skills-dir <path>` for a custom location.
 
 ## Security Model
 

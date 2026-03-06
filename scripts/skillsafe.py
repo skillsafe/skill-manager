@@ -4,7 +4,7 @@ SkillSafe — secured skill registry client for AI coding tools.
 
 A single-file Python client (stdlib only) that can scan, save, share, install,
 and verify skills from the SkillSafe registry. Designed to run inside
-Claude Code, Cursor, Windsurf, and similar AI-assisted development tools.
+Claude Code, Cursor, Windsurf, Codex, Gemini CLI, OpenCode, OpenClaw, and similar AI-assisted development tools.
 
 Usage:
     python skillsafe.py auth                              # browser login
@@ -111,13 +111,29 @@ TOOL_SKILLS_DIRS: Dict[str, Path] = {
     "claude": Path.home() / ".claude" / "skills",
     "cursor": Path.home() / ".cursor" / "skills",
     "windsurf": Path.home() / ".windsurf" / "skills",
+    "codex": Path.home() / ".agents" / "skills",
+    "gemini": Path.home() / ".gemini" / "skills",
+    "opencode": Path.home() / ".config" / "opencode" / "skills",
     "openclaw": Path.home() / ".openclaw" / "workspace" / "skills",
 }
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "claude": "Claude Code",
     "cursor": "Cursor",
     "windsurf": "Windsurf",
+    "codex": "Codex",
+    "gemini": "Gemini CLI",
+    "opencode": "OpenCode",
     "openclaw": "OpenClaw",
+}
+# Project-level skills directories (relative to cwd) — not all tools use .<tool>/skills/
+TOOL_PROJECT_SKILLS_SUBDIRS: Dict[str, str] = {
+    "claude": ".claude/skills",
+    "cursor": ".cursor/skills",
+    "windsurf": ".windsurf/skills",
+    "codex": ".agents/skills",
+    "gemini": ".gemini/skills",
+    "opencode": ".opencode/skills",
+    "openclaw": "skills",
 }
 
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -1412,6 +1428,23 @@ class SkillSafeClient:
         )
         return resp.get("data", resp)
 
+    def upload_demo(self, namespace: str, name: str, version: str, demo_json: Any, title: str = "") -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{version}/demos — upload a demo recording."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        payload: Dict[str, Any] = {"demo": demo_json}
+        if title:
+            payload["title"] = title
+        body = json.dumps(payload).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/demos",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
     def download_via_share(self, share_id: str):
         """
         GET /v1/share/{share_id}/download — download via share link.
@@ -1883,7 +1916,13 @@ def _detect_tool() -> str:
     not just the ones listed in TOOL_SKILLS_DIRS.  For example a script
     installed at ``~/.copilot/skills/skillsafe/scripts/skillsafe.py``
     will return ``"copilot"``.
+
+    Codex installs skills under ``~/.agents/skills/`` (no tool prefix in the
+    directory name), so the detected folder name ``"agents"`` is mapped to
+    ``"codex"`` via the alias table below.
     """
+    # Map raw folder names to canonical tool keys when they differ.
+    _dir_aliases = {"agents": "codex"}
     try:
         script_path = Path(__file__).resolve()
         home = Path.home().resolve()
@@ -1895,7 +1934,8 @@ def _detect_tool() -> str:
             and parts[0].startswith(".")
             and parts[1] == "skills"
         ):
-            return parts[0].lstrip(".")  # e.g. "cursor"
+            raw = parts[0].lstrip(".")  # e.g. "cursor" or "agents"
+            return _dir_aliases.get(raw, raw)
     except (ValueError, IndexError):
         pass
     return "cli"
@@ -2489,6 +2529,7 @@ def cmd_install(args: argparse.Namespace) -> None:
 
             # Install to final location
             _install_to_target(args, namespace, name, version, local_tree_hash, source_dir=tmppath)
+            _maybe_hint_global_install(args, namespace, name)
 
     # ---------- V1 path (archive) ----------
 
@@ -2531,6 +2572,7 @@ def cmd_install(args: argparse.Namespace) -> None:
 
         # Install to final location (from archive)
         _install_to_target_archive(args, namespace, name, version, local_tree_hash, archive_bytes)
+        _maybe_hint_global_install(args, namespace, name)
 
 
 def _submit_verification(
@@ -2662,6 +2704,25 @@ def _write_install_metadata(
         pass
 
 
+def _maybe_hint_global_install(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+) -> None:
+    """After a default project-local install, print a hint about global install options.
+
+    Skipped when the user already passed ``--tool`` or ``--skills-dir``.
+    """
+    if getattr(args, "tool", None) or getattr(args, "skills_dir", None):
+        return
+
+    tool_names = ", ".join(TOOL_SKILLS_DIRS.keys())
+    print(f"\n  To also install globally (available in all projects), re-run with --tool:")
+    for key, path in TOOL_SKILLS_DIRS.items():
+        label = TOOL_DISPLAY_NAMES.get(key, key)
+        print(f"    skillsafe install @{namespace}/{name} --tool {key:<12}  # {label}: {path}")
+
+
 def _install_to_target(
     args: argparse.Namespace,
     namespace: str,
@@ -2669,8 +2730,8 @@ def _install_to_target(
     version: str,
     tree_hash: str,
     source_dir: Path,
-) -> None:
-    """Copy files from source_dir to the final install location."""
+) -> Path:
+    """Copy files from source_dir to the final install location. Returns install_dir."""
     skills_dir = _resolve_skills_dir(args)
 
     def _safe_copytree(src: Path, dst: Path) -> None:
@@ -2724,13 +2785,14 @@ def _install_to_target(
             current_link.unlink()
         if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.]+)?$', version):
             print(red(f"  Invalid version format: {version}"))
-            return
+            return install_dir
         current_link.symlink_to(version)
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
     _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     _update_lockfile(namespace, name, version, tree_hash)
+    return install_dir
 
 
 def _install_to_target_archive(
@@ -2740,8 +2802,8 @@ def _install_to_target_archive(
     version: str,
     tree_hash: str,
     archive_bytes: bytes,
-) -> None:
-    """Extract a v1 archive to the final install location."""
+) -> Path:
+    """Extract a v1 archive to the final install location. Returns install_dir."""
     skills_dir = _resolve_skills_dir(args)
 
     if skills_dir:
@@ -2779,13 +2841,14 @@ def _install_to_target_archive(
             current_link.unlink()
         if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.]+)?$', version):
             print(red(f"  Invalid version format: {version}"))
-            return
+            return install_dir
         current_link.symlink_to(version)
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
     _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     _update_lockfile(namespace, name, version, tree_hash)
+    return install_dir
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -2856,6 +2919,72 @@ def cmd_yank(args: argparse.Namespace) -> None:
     print(f"  Other versions of the skill remain available.")
     print(f"\n  To install a different version:")
     print(f"    skillsafe install @{namespace}/{name} --version <other-version>")
+
+
+def cmd_demo(args: argparse.Namespace) -> None:
+    """Upload a demo JSON recording for a skill version."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+
+    json_path = args.json_file
+    if not os.path.isfile(json_path):
+        print(f"Error: File not found: {json_path}", file=sys.stderr)
+        sys.exit(1)
+
+    file_size = os.path.getsize(json_path)
+    max_bytes = 5 * 1024 * 1024  # 5 MB
+    if file_size > max_bytes:
+        print(f"Error: Demo file is too large ({file_size} bytes). Maximum size is 5 MB.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            demo_json = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in {json_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(demo_json, dict):
+        print("Error: Demo JSON must be an object.", file=sys.stderr)
+        sys.exit(1)
+
+    if demo_json.get("schema") != "skillsafe-demo/1":
+        print('Error: Invalid demo schema. Expected "skillsafe-demo/1".', file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve title: --title flag > demo.title field > error
+    title: str = getattr(args, "title", "") or demo_json.get("title", "") or ""
+    title = title.strip()
+    if not title:
+        print("Error: title is required. Provide --title or set demo.title in the JSON.", file=sys.stderr)
+        sys.exit(1)
+    if len(title) > 200:
+        print("Error: title must be at most 200 characters.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Uploading demo for {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        result = client.upload_demo(namespace, name, version, demo_json, title=title)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    demo_id = result.get("demo_id", "")
+    url = result.get("url", f"/demo/{demo_id}")
+    msg_count = result.get("message_count", 0)
+
+    print(f"  {bold('Demo uploaded successfully!')}")
+    print(f"  ID:       {demo_id}")
+    print(f"  Title:    {title}")
+    print(f"  Messages: {msg_count}")
+    print(f"  URL:      https://skillsafe.ai{url}")
 
 
 def cmd_info(args: argparse.Namespace) -> None:
@@ -3011,9 +3140,9 @@ def cmd_list(args: argparse.Namespace) -> None:
                 print(f"  {ref:<35} {ver:<12} {path}")
             print()
 
-    # 4. Project-level skills (.<tool>/skills/ in cwd)
-    for tool_key in TOOL_SKILLS_DIRS:
-        project_skills_dir = Path.cwd() / f".{tool_key}" / "skills"
+    # 4. Project-level skills (per-tool subdir in cwd)
+    for tool_key, subdir in TOOL_PROJECT_SKILLS_SUBDIRS.items():
+        project_skills_dir = Path.cwd() / subdir
         if project_skills_dir.is_dir():
             proj_skills = _list_skills_in_dir(project_skills_dir)
             if proj_skills:
@@ -3033,7 +3162,9 @@ def cmd_list(args: argparse.Namespace) -> None:
             label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
             print(f"  {label + ' skills dir:':<25} {agent_dir}")
         print(f"  {'SkillSafe skills dir:':<25} {SKILLS_DIR}")
-        print(f"  {'Project skills dirs:':<25} ./<tool>/skills/")
+        for tool_key, subdir in TOOL_PROJECT_SKILLS_SUBDIRS.items():
+            label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+            print(f"  {label + ' project skills:':<25} ./{subdir}/")
 
 
 
@@ -3048,18 +3179,19 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
 
     --skills-dir <path>  → use that path directly
     --tool <name>        → look up in TOOL_SKILLS_DIRS
-    (neither)            → return None (install to ~/.skillsafe/skills/)
+    --tool project       → .claude/skills/ in current working directory (default)
+    (neither)            → .claude/skills/ in current working directory (default)
     """
     skills_dir = getattr(args, "skills_dir", None)
     if skills_dir:
         return Path(skills_dir).expanduser().resolve()
     tool = getattr(args, "tool", None)
-    if tool:
-        if tool not in TOOL_SKILLS_DIRS:
-            print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}", file=sys.stderr)
-            sys.exit(1)
-        return TOOL_SKILLS_DIRS[tool]
-    return None
+    if tool == "project" or tool is None:
+        return Path.cwd() / ".claude" / "skills"
+    if tool not in TOOL_SKILLS_DIRS:
+        print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}, project", file=sys.stderr)
+        sys.exit(1)
+    return TOOL_SKILLS_DIRS[tool]
 
 
 def _grade_color(grade: str) -> str:
@@ -3182,8 +3314,14 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe save ./my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0 --public
-              skillsafe install @alice/my-skill --tool claude
-              skillsafe install @alice/my-skill --tool cursor
+              skillsafe install @alice/my-skill                      # project (default)
+              skillsafe install @alice/my-skill --tool project        # current project .claude/skills/
+              skillsafe install @alice/my-skill --tool claude         # global ~/.claude/skills/
+              skillsafe install @alice/my-skill --tool cursor         # global ~/.cursor/skills/
+              skillsafe install @alice/my-skill --tool windsurf       # global ~/.windsurf/skills/
+              skillsafe install @alice/my-skill --tool codex          # global ~/.agents/skills/
+              skillsafe install @alice/my-skill --tool gemini         # global ~/.gemini/skills/
+              skillsafe install @alice/my-skill --tool opencode       # global ~/.config/opencode/skills/
               skillsafe install @alice/my-skill --skills-dir ~/custom/skills
               skillsafe search "salesforce automation"
               skillsafe info @alice/my-skill
@@ -3229,8 +3367,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_install.add_argument("--version", help="Specific version (default: latest)")
     install_target = p_install.add_mutually_exclusive_group()
     install_target.add_argument("--skills-dir", help="Install into a custom skills directory")
-    install_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
-        help="Install into a known tool's skills dir (claude, cursor, windsurf, openclaw)")
+    install_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()) + ["project"],
+        help="Install into a known tool's global skills dir (claude, cursor, windsurf, codex, gemini, opencode, openclaw) or 'project' for the current project's .claude/skills/ (default)")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")
@@ -3252,6 +3390,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_yank.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
     p_yank.add_argument("--version", required=True, help="Version to yank (e.g. 1.0.0)")
     p_yank.add_argument("--reason", help="Reason for yanking (shown in version listings)")
+
+    # -- demo ---------------------------------------------------------------
+    p_demo = subparsers.add_parser("demo", help="Upload a demo JSON recording for a skill version")
+    p_demo.add_argument("json_file", help="Path to demo JSON file (skillsafe-demo/1 schema)")
+    p_demo.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_demo.add_argument("--version", required=True, help="Skill version (e.g. 1.0.0)")
+    p_demo.add_argument("--title", help="Override title from JSON (max 200 chars)")
 
     # -- whoami -------------------------------------------------------------
     p_whoami = subparsers.add_parser("whoami", help="Show current authentication status and account info")
@@ -3288,6 +3433,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_list(args)
     elif args.command == "yank":
         cmd_yank(args)
+    elif args.command == "demo":
+        cmd_demo(args)
     elif args.command == "whoami":
         cmd_whoami(args)
     else:
