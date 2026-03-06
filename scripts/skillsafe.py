@@ -1908,7 +1908,7 @@ def _auth_browser(api_base: str) -> None:
     # Detect the invoking tool for a richer API key label (e.g. "cursor")
     label = _detect_tool()
 
-    # Step 1: Create a CLI auth session
+    # Step 1: Create a CLI auth session (15-minute TTL)
     print("Starting browser login...\n")
     try:
         payload = json.dumps({"label": label}).encode()
@@ -1919,6 +1919,7 @@ def _auth_browser(api_base: str) -> None:
         data = result.get("data", result)
         session_id: str = data["session_id"]
         login_url: str = data["login_url"]
+        expires_in: int = int(data.get("expires_in", 900))
         # Validate session_id format to prevent URL path injection
         if not re.match(r'^[a-zA-Z0-9_-]{1,128}$', session_id):
             print("Error: Server returned invalid session ID format.", file=sys.stderr)
@@ -1942,20 +1943,23 @@ def _auth_browser(api_base: str) -> None:
         print(f"Error: Server returned login URL for unexpected host: {parsed_url.hostname!r}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"  Opening browser to sign in...")
-    print(f"  If the browser doesn't open, visit this URL:\n")
+    expires_min = expires_in // 60
+    print(f"  Authorization URL (valid for {expires_min} min):\n")
     print(f"    {bold(login_url)}\n")
+    print(f"  Open this URL in any browser to sign in.")
+    print(f"  Running as an AI agent without browser access? Share the URL above")
+    print(f"  with a human — they can open it on any machine to authorize you.\n")
 
     try:
         webbrowser.open(login_url)
     except Exception:
-        pass  # URL is already printed as fallback
+        pass  # URL is already printed as primary instruction
 
     # Step 3: Poll for approval
-    print("  Waiting for browser authorization", end="", flush=True)
+    print("  Waiting for authorization", end="", flush=True)
 
     poll_interval = 2  # seconds
-    max_wait = 300  # 5 minutes
+    max_wait = expires_in  # match server TTL
     elapsed = 0
 
     while elapsed < max_wait:
