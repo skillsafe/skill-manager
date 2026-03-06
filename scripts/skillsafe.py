@@ -11,8 +11,8 @@ Usage:
     python skillsafe.py scan <path>
     python skillsafe.py save <path> --version <ver> [--description <d>] [--category <c>] [--tags <t>]
     python skillsafe.py share <@namespace/skill> --version <ver> [--public] [--expires <1d|7d|30d|never>]
-    python skillsafe.py install <@namespace/skill> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
-    python skillsafe.py install <share-link> [--skills-dir <dir>] [--tool <name>]
+    python skillsafe.py install <@namespace/skill> [--version <ver>] [--tool <name>] [--location project|global] [--skills-dir <override>]
+    python skillsafe.py install <share-link> [--tool <name>] [--location project|global] [--skills-dir <override>]
     python skillsafe.py search <query> [--category <c>] [--sort <s>]
     python skillsafe.py info <@namespace/skill>
     python skillsafe.py list
@@ -2711,16 +2711,15 @@ def _maybe_hint_global_install(
 ) -> None:
     """After a default project-local install, print a hint about global install options.
 
-    Skipped when the user already passed ``--tool`` or ``--skills-dir``.
+    Skipped when the user already passed ``--location global`` or ``--skills-dir``.
     """
-    if getattr(args, "tool", None) or getattr(args, "skills_dir", None):
+    if getattr(args, "location", "project") == "global" or getattr(args, "skills_dir", None):
         return
 
-    tool_names = ", ".join(TOOL_SKILLS_DIRS.keys())
-    print(f"\n  To also install globally (available in all projects), re-run with --tool:")
+    print(f"\n  To install globally (available in all projects), re-run with --location global --tool <name>:")
     for key, path in TOOL_SKILLS_DIRS.items():
         label = TOOL_DISPLAY_NAMES.get(key, key)
-        print(f"    skillsafe install @{namespace}/{name} --tool {key:<12}  # {label}: {path}")
+        print(f"    skillsafe install @{namespace}/{name} --tool {key:<12} --location global  # {label}: {path}")
 
 
 def _install_to_target(
@@ -3177,21 +3176,29 @@ def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
     """
     Resolve the target skills directory from CLI flags.
 
-    --skills-dir <path>  → use that path directly
-    --tool <name>        → look up in TOOL_SKILLS_DIRS
-    --tool project       → .claude/skills/ in current working directory (default)
-    (neither)            → .claude/skills/ in current working directory (default)
+    --skills-dir <path>                        → use that path directly (overrides everything)
+    --tool <name> --location global            → tool's global skills dir (e.g. ~/.claude/skills/)
+    --tool <name> --location project (default) → tool's project subdir in cwd (e.g. .claude/skills/)
+    (no --tool)   --location project (default) → Path.cwd()
     """
     skills_dir = getattr(args, "skills_dir", None)
     if skills_dir:
         return Path(skills_dir).expanduser().resolve()
+    location = getattr(args, "location", None) or "project"
     tool = getattr(args, "tool", None)
-    if tool == "project" or tool is None:
-        return Path.cwd() / ".claude" / "skills"
-    if tool not in TOOL_SKILLS_DIRS:
-        print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}, project", file=sys.stderr)
+    if tool and tool not in TOOL_SKILLS_DIRS:
+        print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}", file=sys.stderr)
         sys.exit(1)
-    return TOOL_SKILLS_DIRS[tool]
+    if location == "global":
+        if not tool:
+            print("Error: --location global requires --tool <name>", file=sys.stderr)
+            sys.exit(1)
+        return TOOL_SKILLS_DIRS[tool]
+    # project (default)
+    if tool:
+        subdir = TOOL_PROJECT_SKILLS_SUBDIRS.get(tool, f".{tool}/skills")
+        return Path.cwd() / subdir
+    return Path.cwd()
 
 
 def _grade_color(grade: str) -> str:
@@ -3314,21 +3321,21 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe save ./my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0 --public
-              skillsafe install @alice/my-skill                      # project (default)
-              skillsafe install @alice/my-skill --tool project        # current project .claude/skills/
-              skillsafe install @alice/my-skill --tool claude         # global ~/.claude/skills/
-              skillsafe install @alice/my-skill --tool cursor         # global ~/.cursor/skills/
-              skillsafe install @alice/my-skill --tool windsurf       # global ~/.windsurf/skills/
-              skillsafe install @alice/my-skill --tool codex          # global ~/.agents/skills/
-              skillsafe install @alice/my-skill --tool gemini         # global ~/.gemini/skills/
-              skillsafe install @alice/my-skill --tool opencode       # global ~/.config/opencode/skills/
+              skillsafe install @alice/my-skill                                    # current folder (default)
+              skillsafe install @alice/my-skill --tool claude                     # .claude/skills/ in current project
+              skillsafe install @alice/my-skill --tool claude --location global   # global ~/.claude/skills/
+              skillsafe install @alice/my-skill --tool cursor --location global   # global ~/.cursor/skills/
+              skillsafe install @alice/my-skill --tool windsurf --location global # global ~/.windsurf/skills/
+              skillsafe install @alice/my-skill --tool codex --location global    # global ~/.agents/skills/
+              skillsafe install @alice/my-skill --tool gemini --location global   # global ~/.gemini/skills/
+              skillsafe install @alice/my-skill --tool opencode --location global # global ~/.config/opencode/skills/
               skillsafe install @alice/my-skill --skills-dir ~/custom/skills
               skillsafe search "salesforce automation"
               skillsafe info @alice/my-skill
               skillsafe list
               skillsafe backup ~/.claude/skills/my-skill
-              skillsafe restore my-skill --tool claude
-              skillsafe restore my-skill --tool windsurf
+              skillsafe restore my-skill --tool claude --location global
+              skillsafe restore my-skill --tool windsurf --location global
               skillsafe whoami                             # check auth status
         """),
     )
@@ -3365,10 +3372,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_install = subparsers.add_parser("install", help="Install a skill from the registry")
     p_install.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
     p_install.add_argument("--version", help="Specific version (default: latest)")
-    install_target = p_install.add_mutually_exclusive_group()
-    install_target.add_argument("--skills-dir", help="Install into a custom skills directory")
-    install_target.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()) + ["project"],
-        help="Install into a known tool's global skills dir (claude, cursor, windsurf, codex, gemini, opencode, openclaw) or 'project' for the current project's .claude/skills/ (default)")
+    p_install.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
+        help="Tool name — determines the skills subdirectory (claude, cursor, windsurf, codex, gemini, opencode, openclaw)")
+    p_install.add_argument("--location", choices=["project", "global"], default="project",
+        help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
+    p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")
