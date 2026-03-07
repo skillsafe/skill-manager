@@ -97,7 +97,7 @@ def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 RULESET_VERSION = "2026.03.01"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
