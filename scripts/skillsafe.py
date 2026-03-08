@@ -117,6 +117,16 @@ TOOL_SKILLS_DIRS: Dict[str, Path] = {
     "gemini": Path.home() / ".gemini" / "skills",
     "opencode": Path.home() / ".config" / "opencode" / "skills",
     "openclaw": Path.home() / ".openclaw" / "workspace" / "skills",
+    # Extended integrations
+    "cline": Path.home() / ".cline" / "skills",
+    "roo": Path.home() / ".roo" / "skills",
+    "goose": Path.home() / ".config" / "goose" / "skills",
+    "copilot": Path.home() / ".config" / "github-copilot" / "skills",
+    "kiro": Path.home() / ".kiro" / "skills",
+    "trae": Path.home() / ".trae" / "skills",
+    "amp": Path.home() / ".amp" / "skills",
+    "aider": Path.home() / ".aider" / "skills",
+    "vscode": Path.home() / ".vscode" / "skills",
 }
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "claude": "Claude Code",
@@ -126,6 +136,15 @@ TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "gemini": "Gemini CLI",
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
+    "cline": "Cline",
+    "roo": "Roo Code",
+    "goose": "Goose",
+    "copilot": "GitHub Copilot",
+    "kiro": "Kiro",
+    "trae": "Trae",
+    "amp": "AMP",
+    "aider": "Aider",
+    "vscode": "VS Code",
 }
 # Project-level skills directories (relative to cwd) — not all tools use .<tool>/skills/
 TOOL_PROJECT_SKILLS_SUBDIRS: Dict[str, str] = {
@@ -136,6 +155,15 @@ TOOL_PROJECT_SKILLS_SUBDIRS: Dict[str, str] = {
     "gemini": ".gemini/skills",
     "opencode": ".opencode/skills",
     "openclaw": "skills",
+    "cline": ".cline/skills",
+    "roo": ".roo/skills",
+    "goose": ".goose/skills",
+    "copilot": ".github/copilot/skills",
+    "kiro": ".kiro/skills",
+    "trae": ".trae/skills",
+    "amp": ".amp/skills",
+    "aider": ".aider/skills",
+    "vscode": ".vscode/skills",
 }
 
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
@@ -3817,7 +3845,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_install.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
     p_install.add_argument("--version", help="Specific version (default: latest)")
     p_install.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
-        help="Tool name — determines the skills subdirectory (claude, cursor, windsurf, codex, gemini, opencode, openclaw)")
+        help="Tool name — determines the skills subdirectory (claude, cursor, windsurf, codex, gemini, opencode, openclaw, cline, roo, goose, copilot, kiro, trae, amp, aider, vscode)")
     p_install.add_argument("--location", choices=["project", "global"], default="project",
         help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
     p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")

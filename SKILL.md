@@ -18,7 +18,7 @@ mkdir -p <skill-dir>/scripts && curl -fsSL https://skillsafe.ai/scripts/skillsaf
 
 This is only needed for first-time installation from URL. If installed via `skillsafe install`, the script is already included.
 
-**Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
+**Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 
 ## Available Commands
 
@@ -170,7 +170,7 @@ python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py list
 ```
-Shows skills from multiple locations: known tool directories (`~/.claude/skills/`, `~/.cursor/skills/`, `~/.windsurf/skills/`, `~/.agents/skills/`, `~/.gemini/skills/`, `~/.config/opencode/skills/`), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
+Shows skills from multiple locations: all known tool directories (Claude Code, Cursor, Windsurf, Codex, Gemini, OpenCode, OpenClaw, Cline, Roo, Goose, Copilot, Kiro, Trae, AMP, Aider, VS Code), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
 
 ## Improving & Iterating on Skills
 
@@ -329,7 +329,7 @@ Common user requests and which command to use:
 
 ## Configuration
 
-Credentials are stored in `~/.skillsafe/config.json`. By default, `install` places skills in `.claude/skills/` in the current project directory. Use `--tool <name>` (`claude` → `~/.claude/skills/`, `cursor` → `~/.cursor/skills/`, `windsurf` → `~/.windsurf/skills/`, `codex` → `~/.agents/skills/`, `gemini` → `~/.gemini/skills/`, `opencode` → `~/.config/opencode/skills/`, `openclaw`) for global install, or `--skills-dir <path>` for a custom location.
+Credentials are stored in `~/.skillsafe/config.json`. By default, `install` places skills in `.claude/skills/` in the current project directory. Use `--tool <name>` for global install to the tool's standard location, or `--skills-dir <path>` for a custom location. Supported tools: `claude` → `~/.claude/skills/`, `cursor` → `~/.cursor/skills/`, `windsurf` → `~/.windsurf/skills/`, `codex` → `~/.agents/skills/`, `gemini` → `~/.gemini/skills/`, `opencode` → `~/.config/opencode/skills/`, `openclaw` → `~/.openclaw/workspace/skills/`, `cline` → `~/.cline/skills/`, `roo` → `~/.roo/skills/`, `goose` → `~/.config/goose/skills/`, `copilot` → `~/.config/github-copilot/skills/`, `kiro` → `~/.kiro/skills/`, `trae` → `~/.trae/skills/`, `amp` → `~/.amp/skills/`, `aider` → `~/.aider/skills/`, `vscode` → `~/.vscode/skills/`.
 
 ## Security Model
 
