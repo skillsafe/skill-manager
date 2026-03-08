@@ -78,6 +78,12 @@ python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--so
 ```
 Searches publicly shared skills only.
 
+### Lint — Validate a skillsafe.yaml manifest
+```bash
+python3 <skill-dir>/scripts/skillsafe.py lint [path]
+```
+Validates the `skillsafe.yaml` manifest in the given directory (defaults to current directory). Checks: required fields (`name`, `version`, `entrypoint`), valid semver version, entrypoint file exists, description quality, valid category, lowercase tags, and eval pass rate threshold (≥80% required for "Tested" tier). Reports errors (must fix before saving) and warnings (recommendations). Exits with code 1 if any errors are found.
+
 ### Import — Import a GitHub repository as a skill
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py import <github-url>

@@ -1961,6 +1961,134 @@ def cmd_init(args: argparse.Namespace) -> None:
     print()
 
 
+def cmd_lint(args: argparse.Namespace) -> None:
+    """Validate a skillsafe.yaml manifest and report issues."""
+    target = Path(getattr(args, "path", None) or ".").resolve()
+    if not target.is_dir():
+        print(f"Error: {target} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    yaml_path = target / "skillsafe.yaml"
+    if not yaml_path.exists():
+        print(f"  {red('✗')} No {bold('skillsafe.yaml')} found in {target}")
+        print(f"    Run {bold('skillsafe init')} to create one.")
+        sys.exit(1)
+
+    print(f"\n{bold('SkillSafe Lint')} — validating {yaml_path}\n")
+
+    # Parse YAML without a library using simple key: value line parsing
+    manifest: Dict[str, Any] = {}
+    try:
+        text = yaml_path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" in stripped:
+                key, _, value = stripped.partition(":")
+                key = key.strip().strip('"').strip("'")
+                value = value.strip().strip('"').strip("'")
+                if value:  # only store scalar values (ignore list items)
+                    manifest[key] = value
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"  {red('✗')} Could not read skillsafe.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    errors: list = []
+    warnings: list = []
+    passed: list = []
+
+    # --- Required fields ---
+    semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+    name_val = manifest.get("name", "")
+    version_val = manifest.get("version", "")
+    entrypoint_val = manifest.get("entrypoint", "")
+    description_val = manifest.get("description", "")
+
+    if not name_val:
+        errors.append("'name' is required")
+    else:
+        passed.append(f"name: {name_val}")
+
+    if not version_val:
+        errors.append("'version' is required")
+    elif not re.match(semver_re, version_val):
+        errors.append(f"'version' must be valid semver (e.g. 1.0.0), got: {version_val!r}")
+    else:
+        passed.append(f"version: {version_val} (valid semver)")
+
+    if not entrypoint_val:
+        errors.append("'entrypoint' is required (e.g. skill.md)")
+    else:
+        entry_path = target / entrypoint_val
+        if not entry_path.exists():
+            errors.append(f"'entrypoint' file not found: {entrypoint_val} (expected at {entry_path})")
+        else:
+            passed.append(f"entrypoint: {entrypoint_val} (exists)")
+
+    if not description_val:
+        warnings.append("'description' is missing — add one to improve discoverability")
+    elif len(description_val) < 10:
+        warnings.append(f"'description' is very short ({len(description_val)} chars) — a longer description helps users find your skill")
+    else:
+        passed.append(f"description: {description_val[:60]}{'...' if len(description_val) > 60 else ''}")
+
+    # --- Category ---
+    valid_categories = {
+        "code-quality", "code-review", "data-analysis", "database", "deployment",
+        "docs", "frontend", "infra", "performance", "security", "testing", "utility", "other",
+    }
+    category_val = manifest.get("category", "")
+    if category_val and category_val not in valid_categories:
+        warnings.append(f"'category' {category_val!r} is not in the standard list. Valid: {', '.join(sorted(valid_categories))}")
+    elif category_val:
+        passed.append(f"category: {category_val}")
+
+    # --- Tags ---
+    tags_val = manifest.get("tags", "")
+    if tags_val and tags_val not in ("[", "]", "[]", ""):
+        # Inline tags like: tags: code-review,typescript
+        raw_tags = [t.strip().strip('"').strip("'").lstrip("- ") for t in tags_val.replace(",", " ").split()]
+        bad_tags = [t for t in raw_tags if t and (t != t.lower() or " " in t)]
+        if bad_tags:
+            warnings.append(f"Tags should be lowercase with no spaces. Problematic: {bad_tags}")
+        elif raw_tags:
+            passed.append(f"tags: {', '.join(raw_tags[:5])}")
+
+    # --- evals (if present) ---
+    pass_rate_val = manifest.get("pass_rate", "")
+    if pass_rate_val:
+        try:
+            pr = float(pass_rate_val)
+            if pr < 0 or pr > 100:
+                errors.append(f"'evals.pass_rate' must be between 0 and 100, got: {pr}")
+            elif pr < 80:
+                warnings.append(f"'evals.pass_rate' is {pr}% — skills need ≥80% to reach 'Tested' tier")
+            else:
+                passed.append(f"evals.pass_rate: {pr}%")
+        except ValueError:
+            errors.append(f"'evals.pass_rate' must be a number, got: {pass_rate_val!r}")
+
+    # --- Print results ---
+    for p in passed:
+        print(f"  {green('✓')} {p}")
+
+    for w in warnings:
+        print(f"  {yellow('⚠')} {w}")
+
+    for e in errors:
+        print(f"  {red('✗')} {e}")
+
+    print()
+    if errors:
+        print(f"  {red(bold(f'{len(errors)} error(s)'))}, {len(warnings)} warning(s) — fix errors before saving")
+        sys.exit(1)
+    elif warnings:
+        print(f"  {green('Manifest is valid')} ({len(warnings)} warning(s))")
+    else:
+        print(f"  {green(bold('Manifest is valid ✓'))}")
+
+
 def cmd_whoami(args: argparse.Namespace) -> None:
     """Show current authentication status and account info."""
     cfg = load_config()
@@ -3952,6 +4080,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_import = subparsers.add_parser("import", help="Import a GitHub repository as a skill on SkillSafe")
     p_import.add_argument("github_url", help="GitHub repo URL (e.g. github.com/owner/repo or https://github.com/owner/repo)")
 
+    p_lint = subparsers.add_parser("lint", help="Validate a skillsafe.yaml manifest")
+    p_lint.add_argument("path", nargs="?", default=".", help="Path to skill directory (default: current directory)")
+
     args = parser.parse_args(argv)
 
     # Ensure api_base is set in the namespace (subcommand may not define it)
@@ -3996,6 +4127,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_init(args)
     elif args.command == "import":
         cmd_import(args)
+    elif args.command == "lint":
+        cmd_lint(args)
     else:
         parser.print_help()
         sys.exit(1)
