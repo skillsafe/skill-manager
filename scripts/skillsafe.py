@@ -3095,6 +3095,50 @@ def cmd_yank(args: argparse.Namespace) -> None:
     print(f"    skillsafe install @{namespace}/{name} --version <other-version>")
 
 
+def cmd_import(args: argparse.Namespace) -> None:
+    """Import a GitHub repository as a public placeholder skill on SkillSafe."""
+    cfg = require_config()
+
+    raw_url: str = args.github_url.strip()
+    # Normalize: accept bare github.com/owner/repo as well as full https:// URL
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = "https://" + raw_url
+    if not raw_url.startswith("https://github.com/"):
+        print("Error: Only GitHub URLs are supported (github.com/owner/repo).", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Importing {bold(raw_url)} into SkillSafe...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        body = json.dumps({"github_url": raw_url}).encode()
+        result = client._request("POST", "/v1/skills/import-github", body=body, content_type="application/json")
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    namespace = data.get("namespace", "").lstrip("@")
+    name = data.get("name", "")
+    created = data.get("created", False)
+
+    if created:
+        print(f"  {green('✓')} Imported as {bold(f'@{namespace}/{name}')}")
+    else:
+        print(f"  {bold(f'@{namespace}/{name}')} already exists — updated metadata from GitHub")
+
+    if namespace and name:
+        print(f"\n  View at: https://skillsafe.ai/skill/{namespace}/{name}")
+        print(f"\n  {bold('Next steps:')}")
+        print(f"    skillsafe scan <local-path>        — scan and verify the skill files")
+        print(f"    skillsafe save <local-path>        — save a version")
+        print(f"    skillsafe share @{namespace}/{name}  — create a shareable link")
+
+
 def cmd_demo(args: argparse.Namespace) -> None:
     """Upload a demo JSON recording for a skill version."""
     cfg = require_config()
@@ -3905,6 +3949,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_init = subparsers.add_parser("init", help="Initialize a skillsafe.yaml manifest in a skill directory")
     p_init.add_argument("path", nargs="?", default=".", help="Path to skill directory (default: current directory)")
 
+    p_import = subparsers.add_parser("import", help="Import a GitHub repository as a skill on SkillSafe")
+    p_import.add_argument("github_url", help="GitHub repo URL (e.g. github.com/owner/repo or https://github.com/owner/repo)")
+
     args = parser.parse_args(argv)
 
     # Ensure api_base is set in the namespace (subcommand may not define it)
@@ -3947,6 +3994,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_self_update(args)
     elif args.command == "init":
         cmd_init(args)
+    elif args.command == "import":
+        cmd_import(args)
     else:
         parser.print_help()
         sys.exit(1)

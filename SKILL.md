@@ -78,6 +78,12 @@ python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--so
 ```
 Searches publicly shared skills only.
 
+### Import — Import a GitHub repository as a skill
+```bash
+python3 <skill-dir>/scripts/skillsafe.py import <github-url>
+```
+Imports a GitHub repository as a public placeholder skill on SkillSafe. Accepts bare `github.com/owner/repo` or full `https://github.com/owner/repo` URLs. Creates a public skill entry with metadata fetched from GitHub (name, description, stars, language, license). If the skill already exists, refreshes its GitHub metadata. Use this to quickly register an existing GitHub-hosted skill on SkillSafe, then follow up with `save` to upload your local version and `share` to distribute it.
+
 ### Yank — Block downloads of a broken version
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py yank @<namespace>/<skill-name> --version <ver> [--reason <msg>]
