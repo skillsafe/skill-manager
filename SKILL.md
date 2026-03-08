@@ -1,6 +1,6 @@
 ---
 name: skillsafe
-description: Scan, save, share, install, and verify skills from the SkillSafe secured skill registry. Use when the user wants to manage AI coding skills with security scanning and dual-side verification.
+description: Scan, save, share, install, and verify skills from the SkillSafe secured skill registry. Use this skill whenever the user mentions scanning a skill for security issues, saving or publishing a skill to a registry, sharing a skill via a link, installing someone else's skill, searching for skills, uploading a demo recording, checking skill verification status, or anything involving skill versioning, the SkillSafe CLI, or managing AI coding tool skills — even if they don't say "SkillSafe" explicitly. Also use it when the user asks to record a conversation as a demo or wants to showcase how a skill works.
 allowed-tools: Bash, Read, Write
 ---
 
@@ -46,17 +46,23 @@ python3 <skill-dir>/scripts/skillsafe.py save <path> [--version <semver>] [--des
 ```
 Scans the skill, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required. Use `--changelog` to describe what changed in this version (shown in `info`). If `--version` is omitted, the CLI auto-increments the patch version from the latest (e.g., 1.0.2 → 1.0.3). If the skill's content is unchanged from the latest version, the save is skipped.
 
+Saving is intentionally low-friction and private — the goal is to let you checkpoint work in progress without committing to distribution. Think of it like a private git commit: you're preserving the version and its tree hash before you decide whether to share it with anyone.
+
 ### Share — Create a share link for a saved skill
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py share @<namespace>/<skill-name> --version <ver> [--public] [--expires <1d|7d|30d|never>]
 ```
 Creates a share link for a specific version. By default the link is private (only people with the link can access it). Use `--public` to make the skill discoverable via search. Requires email verification and a scan report on the version.
 
+Sharing requires a scan report because SkillSafe's dual-side verification model depends on it: when a consumer installs via the link, their local scan is compared against the sharer's report. Without the sharer's report on record, there's nothing to verify against. This is what makes the supply chain trustworthy — both sides must independently produce a consistent scan result.
+
 ### Install — Install a skill from the registry
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
 Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. By default (no flags), installs into the **current project's `.claude/skills/`** directory so the agent can use it immediately without restarting. Use `--tool project` to make this explicit. Use `--tool <name>` to install into a known tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
+
+The install command does more than download — it independently re-scans the files and submits that report to the server, which compares it against the sharer's original scan. This is the consumer side of dual-side verification: if someone tampered with the archive between publishing and download, the tree hash will mismatch and the install will be blocked. Running the scan locally (rather than trusting the server's copy) is what makes this meaningful — it's the consumer's independent check, not just a server-side assertion.
 
 After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash. The installer also injects `improvable: true` and `registry` fields into the skill's SKILL.md frontmatter if not already present.
 
