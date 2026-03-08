@@ -95,6 +95,60 @@ Upload a recorded chat session showing the skill in action. The demo JSON must f
 ```
 Fields: `schema` (required), `title` (required, max 200 chars), `messages` array with `role`/`content`/`tool_uses`. Limits: max 5 MB, max 1000 messages. The `--title` flag overrides the title in the JSON.
 
+### Demo from Session — Convert a Claude Code session into a demo and upload it
+
+Use this when the user wants to record the current or a recent conversation as a demo for a skill.
+
+**Step 1 — Find the session file**
+
+Claude Code saves sessions as JSONL files under `~/.claude/projects/<project-dir>/`. The project directory name is the absolute project path with every `/` and `.` replaced by `-`:
+
+```bash
+# Compute the sessions directory for the current project
+python3 -c "import os, re; print(re.sub(r'[/.]', '-', os.getcwd()))"
+# → e.g.  -Users-alice-myproject
+
+# List the most recent sessions for this project
+ls -lt ~/.claude/projects/<project-dir>/*.jsonl 2>/dev/null | head -5
+```
+
+To get the path in one shot:
+```bash
+ls -t ~/.claude/projects/$(python3 -c "import os,re; print(re.sub(r'[/.]','-',os.getcwd()))")/*.jsonl 2>/dev/null | head -3
+```
+
+Pick the most recently modified `.jsonl` file that represents the session you want to record. Avoid the file currently being written (the most recent one if you are mid-conversation); prefer the second most recent for a complete past session.
+
+**Step 2 — Convert, clean, and upload**
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py demo-from-session \
+  <session.jsonl> \
+  @<ns>/<name> --version <ver> \
+  --title "<what this demo shows>" \
+  --filter-keyword <skill-name>
+```
+
+`--filter-keyword` keeps only messages that mention the skill name (in content or tool inputs/outputs), which removes off-topic turns and keeps the demo focused. Use the skill's short name (e.g. `skillsafe`, `code-review`).
+
+**Step 3 — Preview before uploading (optional)**
+
+```bash
+# Save to file first, inspect, then upload
+python3 <skill-dir>/scripts/skillsafe.py demo-from-session <session.jsonl> \
+  --title "<title>" --filter-keyword <keyword> --out demo.json
+
+# Review demo.json, then upload
+python3 <skill-dir>/scripts/skillsafe.py demo demo.json @<ns>/<name> --version <ver>
+```
+
+**What the command does automatically:**
+- Pairs every `tool_use` block with its `tool_result`, merges into `tool_uses` array
+- Skips system-injected tags (`<local-command-caveat>`, `<system-reminder>`, etc.)
+- Masks sensitive values: API keys, GitHub tokens, AWS keys, Bearer tokens, email addresses, home directory paths
+- Truncates tool outputs longer than 120 lines (configurable with `--max-output-lines N`)
+- Reports how many sensitive values were replaced before uploading
+
 ### Info — Get skill details
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
@@ -259,6 +313,7 @@ Common user requests and which command to use:
 - "push a new version" / "publish my changes" -> `save <path> --changelog "what changed"`
 - "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old>` (project) or `install @ns/name --version <old> --tool claude` (global)
 - "yank this version" / "block this version" / "this version is broken" -> `yank @ns/name --version <ver> --reason "..."`
+- "record this session as a demo" / "upload a demo of this skill" / "create a demo from our conversation" -> `demo-from-session` workflow: find the session JSONL, convert with `--filter-keyword <skill-name>`, upload
 
 ## Configuration
 
