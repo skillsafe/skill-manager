@@ -24,6 +24,12 @@ This is only needed for first-time installation from URL. If installed via `skil
 
 Run all commands using `python3` and the script at `scripts/skillsafe.py` inside this skill's directory.
 
+### Init — Create a skillsafe.yaml manifest
+```bash
+python3 <skill-dir>/scripts/skillsafe.py init [path]
+```
+Interactive wizard that generates a `skillsafe.yaml` manifest (and `.skillsafe.json` for legacy compatibility) in the given directory (defaults to current directory). Prompts for skill name, namespace, version, description, category, tags, and entrypoint file. After running, prints the next steps: auth → save → share.
+
 ### Auth — Sign in via browser
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py auth
