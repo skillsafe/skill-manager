@@ -3023,6 +3023,299 @@ def cmd_demo(args: argparse.Namespace) -> None:
     print(f"  URL:      https://skillsafe.ai{url}")
 
 
+# ---------------------------------------------------------------------------
+# demo-from-session: convert Claude Code JSONL → skillsafe-demo/1 + upload
+# ---------------------------------------------------------------------------
+
+# Sensitive data patterns (ordered: more specific first)
+_MASK_PATTERNS: List[Tuple[str, str]] = [
+    (r"sk-ant-[A-Za-z0-9_\-]{20,}", "[ANTHROPIC_KEY]"),
+    (r"\bsk-[A-Za-z0-9]{20,}", "[API_KEY]"),
+    (r"ghp_[A-Za-z0-9]{36,}", "[GITHUB_TOKEN]"),
+    (r"github_pat_[A-Za-z0-9_]{59,}", "[GITHUB_TOKEN]"),
+    (r"AKIA[A-Z0-9]{16}", "[AWS_ACCESS_KEY]"),
+    (r"Bearer [A-Za-z0-9\-._~+/]+=*", "Bearer [TOKEN]"),
+    (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[EMAIL]"),
+    (
+        r"(?i)(api[_\-]?key|secret[_\-]?key|access[_\-]?token|auth[_\-]?token)"
+        r"\s*[=:]\s*[\"']?([A-Za-z0-9_\-]{16,})[\"']?",
+        r"\1=[SECRET]",
+    ),
+]
+
+# User message content that should be skipped (system-injected tags)
+_SKIP_CONTENT_TAGS = (
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<user-prompt-submit-hook>",
+    "<system-reminder>",
+    "<function_calls>",
+)
+
+
+def _mask_sensitive(text: str, home_dir: str = "") -> Tuple[str, int]:
+    """Mask sensitive data in *text*. Returns (masked_text, replacement_count)."""
+    count = 0
+    if home_dir and home_dir in text:
+        text = text.replace(home_dir, "~")
+        count += 1
+    for pattern, replacement in _MASK_PATTERNS:
+        new_text, n = re.subn(pattern, replacement, text)
+        if n:
+            text = new_text
+            count += n
+    return text, count
+
+
+def _truncate_output(text: str, max_lines: int = 120) -> str:
+    """Keep at most *max_lines* of a tool output, summarising the middle."""
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    head = (max_lines * 2) // 3
+    tail = max_lines // 6
+    omitted = len(lines) - head - tail
+    return "\n".join(lines[:head] + [f"[... {omitted} lines omitted ...]"] + lines[-tail:])
+
+
+def _format_tool_input(name: str, input_obj: Any) -> str:
+    """Render tool input as a human-readable string."""
+    if not isinstance(input_obj, dict):
+        return str(input_obj)[:500]
+    if name == "Bash":
+        return input_obj.get("command", json.dumps(input_obj))
+    if name == "Read":
+        return input_obj.get("file_path", json.dumps(input_obj))
+    if name == "Glob":
+        pat = input_obj.get("pattern", "")
+        path = input_obj.get("path", "")
+        return f"{pat} in {path}" if path else pat
+    if name == "Grep":
+        return input_obj.get("pattern", json.dumps(input_obj))
+    if name in ("Edit", "Write", "NotebookEdit"):
+        return input_obj.get("file_path", json.dumps(input_obj))
+    if name == "Agent":
+        return (input_obj.get("prompt") or json.dumps(input_obj))[:300]
+    return json.dumps(input_obj, ensure_ascii=False)[:500]
+
+
+def _convert_claude_session(
+    path: str,
+    filter_keyword: Optional[str] = None,
+    max_output_lines: int = 120,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Convert a Claude Code session JSONL to skillsafe-demo/1 message list.
+
+    Returns ``(messages, total_masked_count)``.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+
+    home_dir = str(Path.home())
+
+    # Pass 1 — build tool_use_id → output string map
+    tool_results: Dict[str, str] = {}
+    for entry in entries:
+        if entry.get("type") != "user":
+            continue
+        content = entry.get("message", {}).get("content", "")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            tool_id = item.get("tool_use_id", "")
+            result = item.get("content", "")
+            if isinstance(result, list):
+                result = "\n".join(b.get("text", "") for b in result if isinstance(b, dict))
+            tool_results[tool_id] = str(result)
+
+    # Pass 2 — build messages list
+    messages: List[Dict[str, Any]] = []
+    total_masked = 0
+
+    for entry in entries:
+        msg_type = entry.get("type", "")
+        content = entry.get("message", {}).get("content", "")
+
+        if msg_type == "assistant":
+            if not isinstance(content, list):
+                continue
+            text_parts: List[str] = []
+            tool_uses: List[Dict[str, str]] = []
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    t = item.get("text", "").strip()
+                    if t:
+                        t, n = _mask_sensitive(t, home_dir)
+                        total_masked += n
+                        text_parts.append(t)
+                elif item.get("type") == "tool_use":
+                    tool_id = item.get("id", "")
+                    tool_name = item.get("name", "")
+                    input_str = _format_tool_input(tool_name, item.get("input", {}))
+                    input_str, n = _mask_sensitive(input_str, home_dir)
+                    total_masked += n
+                    output_str = _truncate_output(tool_results.get(tool_id, ""), max_output_lines)
+                    output_str, n = _mask_sensitive(output_str, home_dir)
+                    total_masked += n
+                    tool_uses.append({"tool": tool_name, "input": input_str, "output": output_str})
+
+            if not text_parts and not tool_uses:
+                continue
+            msg: Dict[str, Any] = {"role": "assistant", "content": "\n\n".join(text_parts)}
+            if tool_uses:
+                msg["tool_uses"] = tool_uses
+            messages.append(msg)
+
+        elif msg_type == "user":
+            if isinstance(content, str):
+                if any(tag in content for tag in _SKIP_CONTENT_TAGS):
+                    continue
+                text = content.strip()
+                if not text:
+                    continue
+                text, n = _mask_sensitive(text, home_dir)
+                total_masked += n
+                messages.append({"role": "user", "content": text})
+            elif isinstance(content, list):
+                # Pure tool-result messages are already consumed via tool_results map
+                if all(isinstance(i, dict) and i.get("type") == "tool_result" for i in content if isinstance(i, dict)):
+                    continue
+                text_parts = []
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "text":
+                        continue
+                    t = item.get("text", "").strip()
+                    if t and not any(t.startswith(tag) for tag in _SKIP_CONTENT_TAGS):
+                        t, n = _mask_sensitive(t, home_dir)
+                        total_masked += n
+                        text_parts.append(t)
+                if text_parts:
+                    messages.append({"role": "user", "content": "\n\n".join(text_parts)})
+
+    # Optional keyword filter — keep messages that mention the keyword
+    if filter_keyword:
+        kw = filter_keyword.lower()
+        messages = [
+            m for m in messages
+            if kw in m.get("content", "").lower()
+            or any(
+                kw in u.get("tool", "").lower()
+                or kw in u.get("input", "").lower()
+                or kw in u.get("output", "").lower()
+                for u in m.get("tool_uses", [])
+            )
+        ]
+
+    return messages, total_masked
+
+
+def cmd_demo_from_session(args: argparse.Namespace) -> None:
+    """Convert a Claude Code session JSONL to skillsafe-demo/1 and optionally upload."""
+    session_path: str = args.session
+    if not os.path.isfile(session_path):
+        print(f"Error: Session file not found: {session_path}", file=sys.stderr)
+        sys.exit(1)
+
+    skill_ref: Optional[str] = getattr(args, "skill", None)
+    version: Optional[str] = getattr(args, "version", None)
+    title: str = (getattr(args, "title", None) or "").strip()
+    out_path: Optional[str] = getattr(args, "out", None)
+    filter_keyword: Optional[str] = getattr(args, "filter_keyword", None)
+    max_output_lines: int = getattr(args, "max_output_lines", 120)
+    no_upload: bool = getattr(args, "no_upload", False)
+
+    if not title:
+        print("Error: --title is required.", file=sys.stderr)
+        sys.exit(1)
+    if len(title) > 200:
+        print("Error: --title must be at most 200 characters.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Converting: {session_path}")
+    if filter_keyword:
+        print(f"Filter keyword: {filter_keyword!r}")
+
+    try:
+        messages, mask_count = _convert_claude_session(
+            session_path,
+            filter_keyword=filter_keyword,
+            max_output_lines=max_output_lines,
+        )
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error reading session file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not messages:
+        print("Error: No usable messages found (or all filtered out).", file=sys.stderr)
+        sys.exit(1)
+
+    demo_json: Dict[str, Any] = {
+        "schema": "skillsafe-demo/1",
+        "title": title,
+        "messages": messages,
+    }
+
+    size_bytes = len(json.dumps(demo_json).encode("utf-8"))
+    print(f"  Messages: {len(messages)}")
+    print(f"  Size:     {size_bytes:,} bytes")
+    if mask_count:
+        print(f"  Masked:   {mask_count} sensitive value(s) replaced")
+
+    if size_bytes > 5 * 1024 * 1024:
+        print(
+            f"\nError: Demo is too large ({size_bytes:,} bytes, max 5 MB).\n"
+            "Try --max-output-lines to truncate tool outputs more aggressively,\n"
+            "or --filter-keyword to keep only relevant messages.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # --- save to file -------------------------------------------------------
+    if out_path or no_upload or not skill_ref or not version:
+        target = out_path
+        if not target:
+            fd, target = tempfile.mkstemp(suffix=".json", prefix="skillsafe-demo-")
+            os.close(fd)
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(demo_json, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"\nSaved to: {target}")
+        if skill_ref and version:
+            print(f"To upload: skillsafe demo {target} {skill_ref} --version {version}")
+        return
+
+    # --- upload directly ----------------------------------------------------
+    cfg = require_config()
+    namespace, name = parse_skill_ref(skill_ref)
+    print(f"\nUploading demo for {bold(f'@{namespace}/{name}')} v{version}...")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    try:
+        result = client.upload_demo(namespace, name, version, demo_json, title=title)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    demo_id = result.get("demo_id", "")
+    url = result.get("url", f"/demo/{demo_id}")
+    print(f"  {bold('Demo uploaded successfully!')}")
+    print(f"  ID:       {demo_id}")
+    print(f"  Title:    {title}")
+    print(f"  Messages: {result.get('message_count', len(messages))}")
+    print(f"  URL:      https://skillsafe.ai{url}")
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     """Show detailed information about a skill."""
     namespace, name = parse_skill_ref(args.skill)
@@ -3375,6 +3668,9 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe restore my-skill --tool windsurf --location global
               skillsafe update                             # update CLI to latest version
               skillsafe whoami                             # check auth status
+              skillsafe demo-from-session ~/.claude/projects/.../session.jsonl @alice/my-skill --version 1.0.0 --title "Installing a skill"
+              skillsafe demo-from-session session.jsonl --title "Preview" --no-upload
+              skillsafe demo-from-session session.jsonl @alice/my-skill --version 1.0.0 --title "Skill demo" --filter-keyword skillsafe
         """),
     )
     parser.add_argument("--api-base", default=None, help="API base URL (default: %(default)s)")
@@ -3444,6 +3740,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_demo.add_argument("--version", required=True, help="Skill version (e.g. 1.0.0)")
     p_demo.add_argument("--title", help="Override title from JSON (max 200 chars)")
 
+    # -- demo-from-session --------------------------------------------------
+    p_dfs = subparsers.add_parser(
+        "demo-from-session",
+        help="Convert a Claude Code session JSONL to a SkillSafe demo and upload it",
+    )
+    p_dfs.add_argument("session", help="Path to Claude Code session JSONL file (~/.claude/projects/.../session.jsonl)")
+    p_dfs.add_argument("skill", nargs="?", help="Skill reference (e.g. @alice/my-skill). Omit with --no-upload.")
+    p_dfs.add_argument("--version", help="Skill version (e.g. 1.0.0). Required when uploading.")
+    p_dfs.add_argument("--title", required=True, help="Demo title shown on skillsafe.ai (max 200 chars)")
+    p_dfs.add_argument("--out", metavar="FILE", help="Save converted JSON to FILE instead of uploading")
+    p_dfs.add_argument("--filter-keyword", metavar="WORD",
+        help="Keep only messages that contain WORD (e.g. 'skillsafe' to focus the demo on skill usage)")
+    p_dfs.add_argument("--max-output-lines", type=int, default=120, metavar="N",
+        help="Truncate tool outputs longer than N lines (default: 120)")
+    p_dfs.add_argument("--no-upload", action="store_true",
+        help="Convert and save to a temp file without uploading")
+
     # -- whoami -------------------------------------------------------------
     p_whoami = subparsers.add_parser("whoami", help="Show current authentication status and account info")
 
@@ -3485,6 +3798,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_yank(args)
     elif args.command == "demo":
         cmd_demo(args)
+    elif args.command == "demo-from-session":
+        cmd_demo_from_session(args)
     elif args.command == "whoami":
         cmd_whoami(args)
     elif args.command in ("update", "self-update"):
